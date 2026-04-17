@@ -12,6 +12,12 @@ pub struct ReplayDriver {
     events_dropped: u64,
 }
 
+impl Default for ReplayDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReplayDriver {
     pub fn new() -> Self {
         Self {
@@ -27,7 +33,7 @@ impl ReplayDriver {
         &mut self,
         source: &mut S,
         producer: &mut MarketEventProducer,
-        clock: &C,
+        _clock: &C,
     ) -> u64 {
         info!("replay started");
 

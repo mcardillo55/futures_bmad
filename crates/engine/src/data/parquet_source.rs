@@ -1,10 +1,8 @@
-use std::fs::File;
-use std::path::PathBuf;
-use std::sync::Arc;
-
 use arrow::array::{Array, Int8Array, Int64Array, UInt32Array};
 use futures_bmad_core::{FixedPrice, MarketEvent, MarketEventType, Side, UnixNanos};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::fs::File;
+use std::path::PathBuf;
 use tracing::warn;
 
 use super::data_source::DataSource;
@@ -12,6 +10,7 @@ use super::data_source::DataSource;
 /// Reads own-format Parquet files and produces MarketEvents.
 /// Loads lazily via record-batch iteration to avoid loading entire file into memory.
 pub struct ParquetDataSource {
+    #[allow(dead_code)]
     path: PathBuf,
     events: Vec<MarketEvent>,
     cursor: usize,
@@ -206,7 +205,7 @@ mod tests {
 
         let mut source = ParquetDataSource::new(path).unwrap();
         for (i, expected) in events.iter().enumerate() {
-            let actual = source.next_event().expect(&format!("event {i}"));
+            let actual = source.next_event().unwrap_or_else(|| panic!("event {i}"));
             assert_eq!(actual.timestamp, expected.timestamp);
             assert_eq!(actual.price.raw(), expected.price.raw());
             assert_eq!(actual.size, expected.size);

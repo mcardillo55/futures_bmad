@@ -88,20 +88,20 @@ impl DataSource for MultiDayDataSource {
     fn next_event(&mut self) -> Option<MarketEvent> {
         loop {
             // Try current source
-            if let Some(ref mut source) = self.current_source {
-                if let Some(event) = source.next_event() {
-                    let ts = event.timestamp.as_nanos();
-                    if ts < self.last_ts {
-                        warn!(
-                            ts,
-                            last_ts = self.last_ts,
-                            "non-monotonic timestamp across file boundary"
-                        );
-                    }
-                    self.last_ts = ts;
-                    self.total_events += 1;
-                    return Some(event);
+            if let Some(ref mut source) = self.current_source
+                && let Some(event) = source.next_event()
+            {
+                let ts = event.timestamp.as_nanos();
+                if ts < self.last_ts {
+                    warn!(
+                        ts,
+                        last_ts = self.last_ts,
+                        "non-monotonic timestamp across file boundary"
+                    );
                 }
+                self.last_ts = ts;
+                self.total_events += 1;
+                return Some(event);
             }
 
             // Current source exhausted — try next file

@@ -101,7 +101,7 @@ impl<C: Clock> EventLoop<C> {
 
         // Pop and process event
         if let Some(event) = self.consumer.try_pop() {
-            let now = event.timestamp.as_nanos();
+            let _now = event.timestamp.as_nanos();
 
             // Update order book regardless of gate state
             apply_market_event(&mut self.book, &event);
@@ -139,7 +139,7 @@ impl<C: Clock> EventLoop<C> {
         }
 
         // Periodic stale check (every N iterations) to detect silence
-        if self.tick_count % STALE_CHECK_INTERVAL == 0 {
+        if self.tick_count.is_multiple_of(STALE_CHECK_INTERVAL) {
             let now = self.clock.now().as_nanos();
             let market_open = self.clock.is_market_open();
             if let Some(gap_nanos) = self.stale_detector.check_stale(now, market_open) {
@@ -257,7 +257,7 @@ mod tests {
     fn handle_can_stop_loop() {
         let (_producer, consumer) = market_event_queue(16);
         let clock = SimClock::new(BASE_TS);
-        let mut event_loop = EventLoop::new(consumer, clock, 3.0);
+        let event_loop = EventLoop::new(consumer, clock, 3.0);
         let handle = event_loop.handle();
 
         event_loop.running.store(true, Ordering::Release);

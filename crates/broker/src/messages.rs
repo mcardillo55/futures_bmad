@@ -34,6 +34,7 @@ impl RithmicMarketMessage {
         }
     }
 
+    #[allow(dead_code)]
     pub fn timestamp(&self) -> UnixNanos {
         match self {
             Self::Trade { timestamp, .. }

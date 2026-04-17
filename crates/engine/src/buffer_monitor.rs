@@ -27,6 +27,12 @@ pub struct BufferMonitor {
     state: BufferState,
 }
 
+impl Default for BufferMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BufferMonitor {
     pub fn new() -> Self {
         Self {

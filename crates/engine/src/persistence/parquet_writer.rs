@@ -10,7 +10,7 @@ use futures_bmad_core::{MarketEvent, MarketEventType, Side};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use tracing::{info, warn};
+use tracing::info;
 
 const ROW_GROUP_SIZE: usize = 8192;
 
@@ -56,6 +56,12 @@ pub fn file_path_for(base_dir: &Path, symbol: &str, date: NaiveDate) -> PathBuf 
 /// Tracks the current date for file rollover detection.
 pub struct DateTracker {
     current_date: Option<NaiveDate>,
+}
+
+impl Default for DateTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DateTracker {
@@ -109,17 +115,17 @@ impl MarketDataWriter {
         let event_date = nanos_to_date(event.timestamp.as_nanos());
 
         // Check for date rollover — flush old date's data before switching
-        if let Some(current) = self.date_tracker.current_date() {
-            if current != event_date {
-                // Flush buffer to old date's file, then close it
-                self.flush_buffer()?;
-                self.close_writer()?;
-                info!(
-                    old_date = %current,
-                    new_date = %event_date,
-                    "Parquet file date rollover"
-                );
-            }
+        if let Some(current) = self.date_tracker.current_date()
+            && current != event_date
+        {
+            // Flush buffer to old date's file, then close it
+            self.flush_buffer()?;
+            self.close_writer()?;
+            info!(
+                old_date = %current,
+                new_date = %event_date,
+                "Parquet file date rollover"
+            );
         }
         // Update tracker to new date (or set initial date)
         self.date_tracker.check_rollover(event_date);

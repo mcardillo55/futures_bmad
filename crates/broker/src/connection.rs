@@ -62,7 +62,7 @@ impl RithmicCredentials {
 
     /// Build a RithmicConfig, exposing secrets only at the TLS handshake boundary.
     fn to_rithmic_config(&self) -> Result<RithmicConfig, BrokerError> {
-        let mut builder = RithmicConfig::builder(self.env.clone())
+        let mut builder = RithmicConfig::builder(self.env)
             .user(self.user.expose_secret().to_string())
             .password(self.password.expose_secret().to_string())
             .system_name(self.system_name.clone());
@@ -156,6 +156,7 @@ impl RithmicConnection {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         self.plant.is_some()
     }

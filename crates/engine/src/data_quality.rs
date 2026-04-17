@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use futures_bmad_core::{Clock, UnixNanos};
 use tracing::{info, warn};
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
@@ -73,6 +72,12 @@ pub struct SequenceGapDetector {
     last_seq: HashMap<u32, u64>,
 }
 
+impl Default for SequenceGapDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SequenceGapDetector {
     pub fn new() -> Self {
         Self {
@@ -107,6 +112,12 @@ impl SequenceGapDetector {
 pub struct DataQualityGate {
     state: GateState,
     gated_since_nanos: u64,
+}
+
+impl Default for DataQualityGate {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DataQualityGate {

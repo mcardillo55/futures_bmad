@@ -1,6 +1,6 @@
 # Story 2.2: Order Book Reconstruction from Live Feed
 
-Status: review
+Status: done
 
 ## Story
 
@@ -60,6 +60,16 @@ So that signal computation always has current market state.
 - [x] 7.4: Test buffer monitor threshold transitions and hysteresis
 - [x] 7.5: Test OrderBook `is_tradeable()` edge cases
 
+### Review Findings
+
+- [x] [Review][Defer] Only level 0 updated — L2 depth levels deferred until L2 messages parsed (Story 2.2 handles L1 from Story 2.1)
+- [x] [Review][Defer] Buffer state not enforced (trading disabled/circuit break) — enforcement belongs to Epic 5 Risk Management
+- [x] [Review][Patch] EventLoop.running was non-atomic — fixed: replaced with Arc<AtomicBool> + EventLoopHandle for thread-safe stop
+- [x] [Review][Patch] market_event_queue(0) causes division by zero — fixed: assert capacity >= 2
+- [x] [Review][Defer] Multi-symbol events update single OrderBook — multi-symbol support is a separate concern
+- [x] [Review][Defer] order_count always 0 — MarketEvent has no order_count field, requires upstream schema change
+- [x] [Review][Defer] Infinite ingest loop has no clean shutdown — graceful shutdown is Story 8.3
+
 ## Dev Notes
 
 ### Architecture Patterns & Constraints
@@ -113,3 +123,4 @@ N/A
 
 ### Change Log
 - 2026-04-17: Implemented Story 2.2 — Order Book Reconstruction from Live Feed (all 7 tasks)
+- 2026-04-17: Addressed code review findings — 2 patches fixed, 5 deferred, 7 dismissed

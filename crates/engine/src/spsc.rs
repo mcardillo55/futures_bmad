@@ -77,7 +77,11 @@ impl MarketEventConsumer {
 }
 
 /// Create a new MarketEvent SPSC queue pair.
+///
+/// # Panics
+/// Panics if `capacity` is less than 2.
 pub fn market_event_queue(capacity: usize) -> (MarketEventProducer, MarketEventConsumer) {
+    assert!(capacity >= 2, "SPSC queue capacity must be at least 2");
     let (producer, consumer) = RingBuffer::new(capacity);
     (
         MarketEventProducer {

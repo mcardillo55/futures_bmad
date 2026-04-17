@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use futures_bmad_core::OrderBook;
 use tracing::info;
 
@@ -12,7 +15,19 @@ pub struct EventLoop {
     book: OrderBook,
     monitor: BufferMonitor,
     events_processed: u64,
-    running: bool,
+    running: Arc<AtomicBool>,
+}
+
+/// Handle for stopping the event loop from another thread.
+#[derive(Clone)]
+pub struct EventLoopHandle {
+    running: Arc<AtomicBool>,
+}
+
+impl EventLoopHandle {
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::Release);
+    }
 }
 
 impl EventLoop {
@@ -22,7 +37,14 @@ impl EventLoop {
             book: OrderBook::empty(),
             monitor: BufferMonitor::new(),
             events_processed: 0,
-            running: false,
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Get a handle that can stop the event loop from another thread.
+    pub fn handle(&self) -> EventLoopHandle {
+        EventLoopHandle {
+            running: self.running.clone(),
         }
     }
 
@@ -33,12 +55,12 @@ impl EventLoop {
     }
 
     /// Run the event loop. Spins, polling the SPSC consumer.
-    /// Returns when `stop()` is called or producer is dropped.
+    /// Returns when `stop()` is called via handle, or producer is dropped.
     pub fn run(&mut self) {
-        self.running = true;
+        self.running.store(true, Ordering::Release);
         info!("event loop started");
 
-        while self.running {
+        while self.running.load(Ordering::Acquire) {
             self.tick();
 
             // Yield if buffer is empty to avoid burning CPU
@@ -67,10 +89,6 @@ impl EventLoop {
         }
 
         state
-    }
-
-    pub fn stop(&mut self) {
-        self.running = false;
     }
 
     pub fn order_book(&self) -> &OrderBook {
@@ -122,7 +140,6 @@ mod tests {
         producer.try_push(make_bid(18000, 50));
         producer.try_push(make_ask(18004, 30));
 
-        // Tick twice to process both events
         event_loop.tick();
         event_loop.tick();
 
@@ -151,12 +168,24 @@ mod tests {
         let (mut producer, consumer) = market_event_queue(16);
         let mut event_loop = EventLoop::new(consumer);
 
-        // Fill 80% of buffer (13 out of 16)
         for i in 0..13 {
             producer.try_push(make_bid(18000 + i, 10));
         }
 
         let state = event_loop.tick();
         assert_eq!(state, BufferState::TradingDisabled);
+    }
+
+    #[test]
+    fn handle_can_stop_loop() {
+        let (_producer, consumer) = market_event_queue(16);
+        let mut event_loop = EventLoop::new(consumer);
+        let handle = event_loop.handle();
+
+        // Simulate: start running, then stop via handle
+        event_loop.running.store(true, Ordering::Release);
+        assert!(event_loop.running.load(Ordering::Acquire));
+        handle.stop();
+        assert!(!event_loop.running.load(Ordering::Acquire));
     }
 }

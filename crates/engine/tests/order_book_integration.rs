@@ -1,5 +1,5 @@
 use futures_bmad_core::{FixedPrice, MarketEvent, MarketEventType, OrderBook, Side, UnixNanos};
-use futures_bmad_engine::{market_event_queue, BufferState, EventLoop};
+use futures_bmad_engine::{BufferState, EventLoop, market_event_queue};
 
 fn make_event(
     event_type: MarketEventType,
@@ -186,13 +186,7 @@ fn spsc_drop_counting() {
 
     // These should be dropped
     for _ in 0..5 {
-        assert!(!producer.try_push(make_event(
-            MarketEventType::Trade,
-            18000,
-            10,
-            None,
-            99
-        )));
+        assert!(!producer.try_push(make_event(MarketEventType::Trade, 18000, 10, None, 99)));
     }
     assert_eq!(producer.drop_count(), 5);
 }

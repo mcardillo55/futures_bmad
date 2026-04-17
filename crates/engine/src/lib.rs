@@ -7,7 +7,7 @@ pub mod order_book;
 pub mod spsc;
 
 pub use buffer_monitor::{BufferMonitor, BufferState};
-pub use event_loop::EventLoop;
+pub use event_loop::{EventLoop, EventLoopHandle};
 pub use spsc::{
     MARKET_EVENT_QUEUE_CAPACITY, MarketEventConsumer, MarketEventProducer, market_event_queue,
 };

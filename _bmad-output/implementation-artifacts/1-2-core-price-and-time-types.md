@@ -1,6 +1,6 @@
 # Story 1.2: Core Price & Time Types
 
-Status: ready-for-dev
+Status: review
 
 ## Story
 
@@ -28,46 +28,46 @@ So that all price arithmetic uses integer-only FixedPrice with saturating behavi
 ## Tasks / Subtasks
 
 ### Task 1: Create module structure in core crate (AC: all types exist in core)
-- 1.1: Create `crates/core/src/types/mod.rs` with public module declarations for `fixed_price`, `unix_nanos`, `bar`, `side`
-- 1.2: Update `crates/core/src/lib.rs` to declare `pub mod types` and re-export key types
+- [x] 1.1: Create `crates/core/src/types/mod.rs` with public module declarations for `fixed_price`, `unix_nanos`, `bar`, `side`
+- [x] 1.2: Update `crates/core/src/lib.rs` to declare `pub mod types` and re-export key types
 
 ### Task 2: Implement FixedPrice (AC: quarter-tick representation, saturating arithmetic, Display, derives)
-- 2.1: Create `crates/core/src/types/fixed_price.rs` with `#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct FixedPrice(pub(crate) i64)`
-- 2.2: Implement `FixedPrice::new(raw: i64) -> Self` constructor and `raw(&self) -> i64` accessor
-- 2.3: Implement `saturating_add(&self, other: FixedPrice) -> FixedPrice` using `i64::saturating_add`
-- 2.4: Implement `saturating_sub(&self, other: FixedPrice) -> FixedPrice` using `i64::saturating_sub`
-- 2.5: Implement `saturating_mul(&self, scalar: i64) -> FixedPrice` using `i64::saturating_mul`
-- 2.6: Implement `from_f64(price: f64) -> FixedPrice` with banker's rounding: `(price * 4.0).round() as i64` — verify rounding matches banker's (round half to even)
-- 2.7: Implement `to_f64(&self) -> f64` with doc comment marking it as display-only
-- 2.8: Implement `Display` trait: format as `self.0 as f64 / 4.0` with appropriate decimal places (2 for ES futures)
-- 2.9: Implement `Default` returning `FixedPrice(0)`
+- [x] 2.1: Create `crates/core/src/types/fixed_price.rs` with `#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct FixedPrice(pub(crate) i64)`
+- [x] 2.2: Implement `FixedPrice::new(raw: i64) -> Self` constructor and `raw(&self) -> i64` accessor
+- [x] 2.3: Implement `saturating_add(&self, other: FixedPrice) -> FixedPrice` using `i64::saturating_add`
+- [x] 2.4: Implement `saturating_sub(&self, other: FixedPrice) -> FixedPrice` using `i64::saturating_sub`
+- [x] 2.5: Implement `saturating_mul(&self, scalar: i64) -> FixedPrice` using `i64::saturating_mul`
+- [x] 2.6: Implement `from_f64(price: f64) -> FixedPrice` with banker's rounding: `(price * 4.0).round() as i64` — verify rounding matches banker's (round half to even)
+- [x] 2.7: Implement `to_f64(&self) -> f64` with doc comment marking it as display-only
+- [x] 2.8: Implement `Display` trait: format as `self.0 as f64 / 4.0` with appropriate decimal places (2 for ES futures)
+- [x] 2.9: Implement `Default` returning `FixedPrice(0)`
 
 ### Task 3: Implement UnixNanos (AC: nanosecond precision, chrono conversion, derives)
-- 3.1: Create `crates/core/src/types/unix_nanos.rs` with `#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)] pub struct UnixNanos(pub(crate) u64)`
-- 3.2: Implement `UnixNanos::new(nanos: u64) -> Self` and `as_nanos(&self) -> u64`
-- 3.3: Implement `From<chrono::DateTime<chrono::Utc>>` for UnixNanos
-- 3.4: Implement conversion method `to_datetime(&self) -> chrono::DateTime<chrono::Utc>` marked as display-only
-- 3.5: Implement `Default` returning `UnixNanos(0)`
+- [x] 3.1: Create `crates/core/src/types/unix_nanos.rs` with `#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)] pub struct UnixNanos(pub(crate) u64)`
+- [x] 3.2: Implement `UnixNanos::new(nanos: u64) -> Self` and `as_nanos(&self) -> u64`
+- [x] 3.3: Implement `From<chrono::DateTime<chrono::Utc>>` for UnixNanos
+- [x] 3.4: Implement conversion method `to_datetime(&self) -> chrono::DateTime<chrono::Utc>` marked as display-only
+- [x] 3.5: Implement `Default` returning `UnixNanos(0)`
 
 ### Task 4: Implement Side enum (AC: Buy and Sell variants)
-- 4.1: Create `crates/core/src/types/side.rs` (or include in a shared types file)
-- 4.2: Define `#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] pub enum Side { Buy, Sell }`
+- [x] 4.1: Create `crates/core/src/types/side.rs` (or include in a shared types file)
+- [x] 4.2: Define `#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] pub enum Side { Buy, Sell }`
 
 ### Task 5: Implement Bar struct (AC: OHLCV with FixedPrice and UnixNanos)
-- 5.1: Create `crates/core/src/types/bar.rs`
-- 5.2: Define `Bar { open: FixedPrice, high: FixedPrice, low: FixedPrice, close: FixedPrice, volume: u64, timestamp: UnixNanos }` with `Debug, Clone, Copy`
+- [x] 5.1: Create `crates/core/src/types/bar.rs`
+- [x] 5.2: Define `Bar { open: FixedPrice, high: FixedPrice, low: FixedPrice, close: FixedPrice, volume: u64, timestamp: UnixNanos }` with `Debug, Clone, Copy`
 
 ### Task 6: Write property tests (AC: saturating behavior, round-trip, no panics)
-- 6.1: Create `crates/core/tests/fixed_price_properties.rs`
-- 6.2: Property test: arbitrary `i64` values through `saturating_add`, `saturating_sub`, `saturating_mul` never panic
-- 6.3: Property test: `a.saturating_add(b).saturating_sub(b) == a` for non-overflow values (constrain range to avoid saturation)
-- 6.4: Property test: `from_f64(x).to_f64()` round-trips for valid quarter-tick prices (multiples of 0.25)
-- 6.5: Write unit tests for specific known values: 4482.25 -> FixedPrice(17929), 0.0 -> FixedPrice(0), negative prices
+- [x] 6.1: Create `crates/core/tests/fixed_price_properties.rs`
+- [x] 6.2: Property test: arbitrary `i64` values through `saturating_add`, `saturating_sub`, `saturating_mul` never panic
+- [x] 6.3: Property test: `a.saturating_add(b).saturating_sub(b) == a` for non-overflow values (constrain range to avoid saturation)
+- [x] 6.4: Property test: `from_f64(x).to_f64()` round-trips for valid quarter-tick prices (multiples of 0.25)
+- [x] 6.5: Write unit tests for specific known values: 4482.25 -> FixedPrice(17929), 0.0 -> FixedPrice(0), negative prices
 
 ### Task 7: Write unit tests for UnixNanos
-- 7.1: Test chrono DateTime round-trip conversion
-- 7.2: Test ordering of timestamps
-- 7.3: Test default value
+- [x] 7.1: Test chrono DateTime round-trip conversion
+- [x] 7.2: Test ordering of timestamps
+- [x] 7.3: Test default value
 
 ## Dev Notes
 
@@ -101,6 +101,27 @@ crates/core/tests/
 ## Dev Agent Record
 
 ### Agent Model Used
+Claude Opus 4.6 (1M context)
+
 ### Debug Log References
+N/A
+
 ### Completion Notes List
+- FixedPrice: quarter-tick i64 with saturating arithmetic, banker's rounding, Display
+- UnixNanos: u64 nanoseconds with chrono conversion
+- Side: Buy/Sell enum
+- Bar: OHLCV struct with FixedPrice + UnixNanos
+- 8 unit tests + 5 property tests, all passing
+- Zero clippy warnings
+
+### Change Log
+- 2026-04-16: All tasks completed
+
 ### File List
+- crates/core/src/lib.rs (modified)
+- crates/core/src/types/mod.rs (new)
+- crates/core/src/types/fixed_price.rs (new)
+- crates/core/src/types/unix_nanos.rs (new)
+- crates/core/src/types/side.rs (new)
+- crates/core/src/types/bar.rs (new)
+- crates/core/tests/fixed_price_properties.rs (new)

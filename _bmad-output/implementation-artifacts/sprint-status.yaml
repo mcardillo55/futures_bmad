@@ -50,7 +50,7 @@ development_status:
   1-4-order-and-position-types: review
   1-5-core-traits-and-clock: review
   1-6-event-system-and-config-types: review
-  1-7-test-kit: ready-for-dev
+  1-7-test-kit: review
   epic-1-retrospective: optional
 
   # Epic 2: Market Data Ingestion & Recording

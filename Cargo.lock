@@ -346,9 +346,11 @@ dependencies = [
 name = "futures_testkit"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "futures_core",
  "proptest",
+ "tokio",
 ]
 
 [[package]]

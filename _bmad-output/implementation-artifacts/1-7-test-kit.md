@@ -1,6 +1,6 @@
 # Story 1.7: Test Kit
 
-Status: ready-for-dev
+Status: review
 
 ## Story
 
@@ -116,6 +116,30 @@ crates/testkit/src/
 ## Dev Agent Record
 
 ### Agent Model Used
+Claude Opus 4.6 (1M context)
+
 ### Debug Log References
+- Fixed chrono::Datelike import for SimClock test
+- Removed unused FixedPrice import in mock_broker tests
+
 ### Completion Notes List
+- SimClock: AtomicU64 for Send+Sync, deterministic advance/set
+- OrderBookBuilder: fluent API with f64 prices, monotonic validation, max 10 levels
+- MockBrokerAdapter: Fill/PartialFill/Reject/Timeout behaviors, order recording
+- Market generators: 5 scenarios (normal, FOMC, flash crash, empty, reconnection)
+- Scenario struct combining books + events
+- Custom assertions: price_eq_epsilon, signal_in_range
+- 15 new testkit tests
+
+### Change Log
+- 2026-04-16: All tasks completed
+
 ### File List
+- crates/testkit/Cargo.toml (modified - added async-trait, tokio)
+- crates/testkit/src/lib.rs (modified)
+- crates/testkit/src/sim_clock.rs (new)
+- crates/testkit/src/book_builder.rs (new)
+- crates/testkit/src/mock_broker.rs (new)
+- crates/testkit/src/market_gen.rs (new)
+- crates/testkit/src/scenario.rs (new)
+- crates/testkit/src/assertions.rs (new)

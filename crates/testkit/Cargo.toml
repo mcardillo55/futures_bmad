@@ -7,3 +7,5 @@ edition.workspace = true
 futures_core = { workspace = true }
 proptest = { workspace = true }
 chrono = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }

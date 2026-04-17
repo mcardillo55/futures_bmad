@@ -56,7 +56,7 @@ development_status:
   # Epic 2: Market Data Ingestion & Recording
   epic-2: in-progress
   2-1-rithmic-connection-and-market-data-subscription: done
-  2-2-order-book-reconstruction-from-live-feed: ready-for-dev
+  2-2-order-book-reconstruction-from-live-feed: review
   2-3-market-data-gap-detection: ready-for-dev
   2-4-continuous-market-data-recording-to-parquet: ready-for-dev
   2-5-historical-parquet-ingestion: ready-for-dev

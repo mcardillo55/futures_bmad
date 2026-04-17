@@ -1,6 +1,6 @@
 # Story 2.2: Order Book Reconstruction from Live Feed
 
-Status: ready-for-dev
+Status: review
 
 ## Story
 
@@ -18,47 +18,47 @@ So that signal computation always has current market state.
 ## Tasks / Subtasks
 
 ### Task 1: Create SPSC ring buffer bridge (AC: SPSC, producer never blocks, drop on full)
-- 1.1: Create `engine/src/spsc.rs` with `MarketEventQueue` wrapper around `rtrb::RingBuffer<MarketEvent>` with capacity 131072
-- 1.2: Implement producer side (`MarketEventProducer`) with non-blocking `try_push()` — on full buffer, log drop at `warn` level and increment drop counter
-- 1.3: Implement consumer side (`MarketEventConsumer`) with `try_pop()` returning `Option<MarketEvent>`
-- 1.4: Implement `fill_fraction()` method using `rtrb::RingBuffer::slots()` arithmetic for threshold monitoring
+- [x] 1.1: Create `engine/src/spsc.rs` with `MarketEventQueue` wrapper around `rtrb::RingBuffer<MarketEvent>` with capacity 131072
+- [x] 1.2: Implement producer side (`MarketEventProducer`) with non-blocking `try_push()` — on full buffer, log drop at `warn` level and increment drop counter
+- [x] 1.3: Implement consumer side (`MarketEventConsumer`) with `try_pop()` returning `Option<MarketEvent>`
+- [x] 1.4: Implement `fill_fraction()` method using `rtrb::RingBuffer::slots()` arithmetic for threshold monitoring
 
 ### Task 2: Implement buffer threshold monitoring (AC: 50%/80%/95% thresholds)
-- 2.1: Create `engine/src/buffer_monitor.rs` with `BufferMonitor` struct tracking current fill level
-- 2.2: Implement threshold checks: 50% -> log warning, 80% -> return `BufferState::TradingDisabled`, 95% -> return `BufferState::CircuitBreak`
-- 2.3: Implement hysteresis to avoid flapping — threshold activates on crossing up, deactivates when dropping below threshold minus 5%
-- 2.4: Integrate monitor into event loop so state transitions are acted on each iteration
+- [x] 2.1: Create `engine/src/buffer_monitor.rs` with `BufferMonitor` struct tracking current fill level
+- [x] 2.2: Implement threshold checks: 50% -> log warning, 80% -> return `BufferState::TradingDisabled`, 95% -> return `BufferState::CircuitBreak`
+- [x] 2.3: Implement hysteresis to avoid flapping — threshold activates on crossing up, deactivates when dropping below threshold minus 5%
+- [x] 2.4: Integrate monitor into event loop so state transitions are acted on each iteration
 
 ### Task 3: Implement OrderBook (AC: in-place update, correct ordering)
-- 3.1: Create `engine/src/order_book.rs` with `OrderBook` struct using fixed-size arrays or pre-allocated `Vec` for bid/ask levels (no dynamic allocation after init)
-- 3.2: Implement `apply_l1_update(&mut self, event: &MarketEvent)` updating best bid/ask in-place
-- 3.3: Implement `apply_l2_update(&mut self, event: &MarketEvent)` updating depth levels — bids sorted descending by price, asks sorted ascending by price
-- 3.4: Implement `is_tradeable(&self) -> bool` returning true when both bid and ask are present and spread is non-negative
-- 3.5: Implement `best_bid()`, `best_ask()`, `spread()`, `mid_price()` accessor methods
-- 3.6: Ensure all mutations are in-place — no `Vec::push`, no `Box::new`, no allocator calls on the hot path
+- [x] 3.1: Create `engine/src/order_book.rs` with `OrderBook` struct using fixed-size arrays or pre-allocated `Vec` for bid/ask levels (no dynamic allocation after init)
+- [x] 3.2: Implement `apply_l1_update(&mut self, event: &MarketEvent)` updating best bid/ask in-place
+- [x] 3.3: Implement `apply_l2_update(&mut self, event: &MarketEvent)` updating depth levels — bids sorted descending by price, asks sorted ascending by price
+- [x] 3.4: Implement `is_tradeable(&self) -> bool` returning true when both bid and ask are present and spread is non-negative
+- [x] 3.5: Implement `best_bid()`, `best_ask()`, `spread()`, `mid_price()` accessor methods
+- [x] 3.6: Ensure all mutations are in-place — no `Vec::push`, no `Box::new`, no allocator calls on the hot path
 
 ### Task 4: Implement engine event loop consumer side (AC: dedicated core, in-place update)
-- 4.1: Create `engine/src/event_loop.rs` with `EventLoop` struct holding `MarketEventConsumer`, `OrderBook`, and `BufferMonitor`
-- 4.2: Implement `run()` loop: pop event from SPSC, check buffer thresholds, apply event to OrderBook
-- 4.3: Pin event loop thread to dedicated core using `core_affinity` crate
-- 4.4: Event loop must never allocate — all state is pre-initialized
+- [x] 4.1: Create `engine/src/event_loop.rs` with `EventLoop` struct holding `MarketEventConsumer`, `OrderBook`, and `BufferMonitor`
+- [x] 4.2: Implement `run()` loop: pop event from SPSC, check buffer thresholds, apply event to OrderBook
+- [x] 4.3: Pin event loop thread to dedicated core using `core_affinity` crate
+- [x] 4.4: Event loop must never allocate — all state is pre-initialized
 
 ### Task 5: Wire producer side to broker adapter (AC: SPSC bridge)
-- 5.1: In `broker/src/market_data.rs` or a new `engine/src/ingest.rs`, create async task that reads from `MarketDataStream` and pushes to `MarketEventProducer`
-- 5.2: Ensure I/O thread (Tokio) produces, hot-path thread consumes — no shared mutexes
+- [x] 5.1: In `broker/src/market_data.rs` or a new `engine/src/ingest.rs`, create async task that reads from `MarketDataStream` and pushes to `MarketEventProducer`
+- [x] 5.2: Ensure I/O thread (Tokio) produces, hot-path thread consumes — no shared mutexes
 
 ### Task 6: Integration test with recorded data (AC: snapshot matching)
-- 6.1: Create test fixture with recorded L2 update sequence (hardcoded or from small test file)
-- 6.2: Feed updates through SPSC -> OrderBook pipeline
-- 6.3: Assert OrderBook state matches expected snapshot at each step (bid/ask levels, sizes, ordering)
-- 6.4: Assert `is_tradeable()` returns correct values for various book states (empty, one-sided, crossed, valid)
+- [x] 6.1: Create test fixture with recorded L2 update sequence (hardcoded or from small test file)
+- [x] 6.2: Feed updates through SPSC -> OrderBook pipeline
+- [x] 6.3: Assert OrderBook state matches expected snapshot at each step (bid/ask levels, sizes, ordering)
+- [x] 6.4: Assert `is_tradeable()` returns correct values for various book states (empty, one-sided, crossed, valid)
 
 ### Task 7: Unit tests (AC: all)
-- 7.1: Test SPSC producer drops events on full buffer and increments counter
-- 7.2: Test SPSC consumer returns None on empty buffer
-- 7.3: Test OrderBook bid descending / ask ascending invariant after random updates
-- 7.4: Test buffer monitor threshold transitions and hysteresis
-- 7.5: Test OrderBook `is_tradeable()` edge cases
+- [x] 7.1: Test SPSC producer drops events on full buffer and increments counter
+- [x] 7.2: Test SPSC consumer returns None on empty buffer
+- [x] 7.3: Test OrderBook bid descending / ask ascending invariant after random updates
+- [x] 7.4: Test buffer monitor threshold transitions and hysteresis
+- [x] 7.5: Test OrderBook `is_tradeable()` edge cases
 
 ## Dev Notes
 
@@ -88,6 +88,28 @@ crates/engine/
 ## Dev Agent Record
 
 ### Agent Model Used
+Claude Opus 4.6 (1M context)
+
 ### Debug Log References
+N/A
+
 ### Completion Notes List
+- SPSC ring buffer bridge via rtrb with MarketEventProducer/Consumer, non-blocking try_push with drop counting
+- BufferMonitor with 50%/80%/95% thresholds and 5% hysteresis margin to prevent flapping
+- OrderBook in-place updates via apply_market_event() — uses existing core OrderBook with fixed-size [Level; 10] arrays
+- EventLoop with tick() processing: pop event, check thresholds, apply to OrderBook, pin_to_core support
+- Ingest bridge (engine/src/ingest.rs) connecting async MarketDataStream to SPSC producer
+- Integration tests verifying full SPSC -> EventLoop -> OrderBook pipeline with snapshot matching
+- 22 new engine tests (18 unit + 4 integration), 116 total workspace tests pass
+
 ### File List
+- crates/engine/src/lib.rs (modified — module declarations and re-exports)
+- crates/engine/src/spsc.rs (new — MarketEventProducer, MarketEventConsumer, market_event_queue)
+- crates/engine/src/buffer_monitor.rs (new — BufferMonitor, BufferState, hysteresis logic)
+- crates/engine/src/order_book.rs (new — apply_market_event for L1/L2 updates)
+- crates/engine/src/event_loop.rs (new — EventLoop hot-path consumer)
+- crates/engine/src/ingest.rs (new — async bridge from MarketDataStream to SPSC)
+- crates/engine/tests/order_book_integration.rs (new — integration tests)
+
+### Change Log
+- 2026-04-17: Implemented Story 2.2 — Order Book Reconstruction from Live Feed (all 7 tasks)

@@ -5,6 +5,7 @@ pub mod data_quality;
 pub mod event_loop;
 pub mod ingest;
 pub mod order_book;
+pub mod persistence;
 pub mod spsc;
 
 pub use buffer_monitor::{BufferMonitor, BufferState};

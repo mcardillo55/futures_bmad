@@ -58,7 +58,7 @@ development_status:
   2-1-rithmic-connection-and-market-data-subscription: done
   2-2-order-book-reconstruction-from-live-feed: done
   2-3-market-data-gap-detection: done
-  2-4-continuous-market-data-recording-to-parquet: ready-for-dev
+  2-4-continuous-market-data-recording-to-parquet: done
   2-5-historical-parquet-ingestion: ready-for-dev
   epic-2-retrospective: optional
 

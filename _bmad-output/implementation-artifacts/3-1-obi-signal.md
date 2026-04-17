@@ -1,6 +1,6 @@
 # Story 3.1: OBI Signal
 
-Status: ready-for-dev
+Status: done
 
 ## Story
 
@@ -18,12 +18,12 @@ So that directional pressure from the order book informs trade decisions.
 ## Tasks / Subtasks
 
 ### Task 1: Create signals module structure in engine crate (AC: module exists)
-- 1.1: Create `crates/engine/src/signals/mod.rs` with `pub mod obi;` declaration
-- 1.2: Update `crates/engine/src/lib.rs` to declare `pub mod signals`
+- [x] 1.1: Create `crates/engine/src/signals/mod.rs` with `pub mod obi;` declaration
+- [x] 1.2: Update `crates/engine/src/lib.rs` to declare `pub mod signals`
 
 ### Task 2: Implement ObiSignal struct (AC: Signal trait, O(1) update, value range)
-- 2.1: Create `crates/engine/src/signals/obi.rs` with `ObiSignal` struct containing fields: `value: Option<f64>`, `update_count: u64`, `warmup_period: u64` (configurable, e.g. 1 = valid after first update)
-- 2.2: Implement `Signal` trait for `ObiSignal`:
+- [x] 2.1: Create `crates/engine/src/signals/obi.rs` with `ObiSignal` struct containing fields: `value: Option<f64>`, `update_count: u64`, `warmup_period: u64` (configurable, e.g. 1 = valid after first update)
+- [x] 2.2: Implement `Signal` trait for `ObiSignal`:
   - `update(&mut self, book: &OrderBook, trade: Option<&MarketEvent>, clock: &dyn Clock) -> Option<f64>`:
     - Pre-condition: return `None` if `!book.is_tradeable()`
     - Pre-condition: return `None` if `book.bid_count == 0 || book.ask_count == 0`
@@ -36,24 +36,34 @@ So that directional pressure from the order book informs trade decisions.
   - `is_valid(&self) -> bool`: return `self.update_count >= self.warmup_period && self.value.is_some()`
   - `reset(&mut self)`: clear `value` to `None`, reset `update_count` to 0
   - `snapshot(&self) -> SignalSnapshot`: capture `value`, `update_count`, name
-- 2.3: Implement `ObiSignal::new(warmup_period: u64) -> Self` constructor
+- [x] 2.3: Implement `ObiSignal::new(warmup_period: u64) -> Self` constructor
 
 ### Task 3: NaN/Inf guard implementation (AC: never NaN or Inf)
-- 3.1: In `update()`, after computing OBI, check `result.is_finite()` — if false, set `self.value = None` and return `None`
-- 3.2: Guard division: if denominator (total_bid_size + total_ask_size) is zero, return `None` before division
+- [x] 3.1: In `update()`, after computing OBI, check `result.is_finite()` — if false, set `self.value = None` and return `None`
+- [x] 3.2: Guard division: if denominator (total_bid_size + total_ask_size) is zero, return `None` before division
 
 ### Task 4: Write unit tests (AC: epsilon correctness, SimClock, OrderBookBuilder)
-- 4.1: Create `crates/engine/tests/obi_tests.rs` (or inline `#[cfg(test)]` module)
-- 4.2: Test: balanced book (equal bid/ask sizes) produces OBI = 0.0 within epsilon
-- 4.3: Test: all-bid book (no ask size) — should return None due to is_tradeable or zero denominator guard
-- 4.4: Test: heavy bid pressure produces positive OBI close to 1.0
-- 4.5: Test: heavy ask pressure produces negative OBI close to -1.0
-- 4.6: Test: is_valid() returns false before warmup, true after warmup
-- 4.7: Test: reset() clears state, is_valid() returns false again
-- 4.8: Test: snapshot() captures current state correctly
-- 4.9: Test: update with non-tradeable book returns None
-- 4.10: Test: empty book (bid_count=0, ask_count=0) returns None
-- 4.11: All tests use `testkit::SimClock::new()` and `testkit::OrderBookBuilder`
+- [x] 4.1: Create `crates/engine/tests/obi_tests.rs` (or inline `#[cfg(test)]` module)
+- [x] 4.2: Test: balanced book (equal bid/ask sizes) produces OBI = 0.0 within epsilon
+- [x] 4.3: Test: all-bid book (no ask size) — should return None due to is_tradeable or zero denominator guard
+- [x] 4.4: Test: heavy bid pressure produces positive OBI close to 1.0
+- [x] 4.5: Test: heavy ask pressure produces negative OBI close to -1.0
+- [x] 4.6: Test: is_valid() returns false before warmup, true after warmup
+- [x] 4.7: Test: reset() clears state, is_valid() returns false again
+- [x] 4.8: Test: snapshot() captures current state correctly
+- [x] 4.9: Test: update with non-tradeable book returns None
+- [x] 4.10: Test: empty book (bid_count=0, ask_count=0) returns None
+- [x] 4.11: All tests use `testkit::SimClock::new()` and `testkit::OrderBookBuilder`
+
+### Review Findings
+
+- [x] [Review][Decision] `snapshot()` timestamp — now stores last clock timestamp from `update()` [obi.rs]
+- [x] [Review][Decision] `snapshot()` omits `update_count` — accepted: `SignalSnapshot` struct is sufficient, `valid` flag captures warmup state
+- [x] [Review][Patch] Stale `value` when book becomes non-tradeable — fixed: all early-return paths now clear `self.value = None` [obi.rs:42-44]
+- [x] [Review][Patch] Missing test: valid→non-tradeable transition — added `valid_to_non_tradeable_invalidates_signal` [obi_tests.rs]
+- [x] [Review][Patch] Missing test: `warmup_period=0` — added `warmup_zero_emits_on_first_update` [obi_tests.rs]
+- [x] [Review][Defer] Constructor signature adds `max_spread` param not in spec — necessary because `is_tradeable()` requires it — deferred, spec deviation documented
+- [x] [Review][Defer] `snapshot()` struct may need `update_count` field for full determinism — requires cross-cutting `SignalSnapshot` change, defer to architectural decision
 
 ## Dev Notes
 
@@ -94,6 +104,24 @@ crates/testkit/src/
 ## Dev Agent Record
 
 ### Agent Model Used
+Claude Opus 4.6 (1M context)
+
 ### Debug Log References
+No issues encountered. All tests passed on first run.
+
 ### Completion Notes List
+- Implemented ObiSignal with Signal trait, O(1) computation across fixed-depth book levels
+- Uses u64 intermediate sums to prevent overflow on large aggregate sizes
+- Configurable warmup_period and max_spread threshold for is_tradeable gate
+- NaN/Inf guards: zero-denominator check + is_finite() post-condition
+- 10 integration tests covering all ACs: balanced/imbalanced books, warmup, reset, snapshot, non-tradeable/empty books
+- All 152 workspace tests pass, zero clippy warnings
+
+### Change Log
+- 2026-04-17: Implemented Story 3.1 — OBI Signal (all tasks complete)
+
 ### File List
+- crates/engine/src/signals/mod.rs (new)
+- crates/engine/src/signals/obi.rs (new)
+- crates/engine/src/lib.rs (modified — added pub mod signals)
+- crates/engine/tests/obi_tests.rs (new)

@@ -8,6 +8,8 @@ pub mod ingest;
 pub mod order_book;
 pub mod persistence;
 pub mod replay;
+pub mod risk;
+pub mod signals;
 pub mod spsc;
 
 pub use buffer_monitor::{BufferMonitor, BufferState};

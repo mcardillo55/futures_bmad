@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-16
-last_updated: 2026-04-16
+last_updated: 2026-04-17
 project: futures_bmad
 project_key: NOKEY
 tracking_system: file-system
@@ -64,11 +64,11 @@ development_status:
 
   # Epic 3: Signal Analysis & Trade Decision Engine
   epic-3: in-progress
-  3-1-obi-signal: ready-for-dev
-  3-2-vpin-signal: ready-for-dev
-  3-3-microprice-signal: ready-for-dev
-  3-4-structural-price-levels: ready-for-dev
-  3-5-composite-evaluation-and-fee-aware-gating: ready-for-dev
+  3-1-obi-signal: done
+  3-2-vpin-signal: done
+  3-3-microprice-signal: done
+  3-4-structural-price-levels: done
+  3-5-composite-evaluation-and-fee-aware-gating: done
   epic-3-retrospective: optional
 
   # Epic 4: Order Execution, Position Management & Event Journal

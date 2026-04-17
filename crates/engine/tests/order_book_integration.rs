@@ -12,6 +12,7 @@ fn make_event(
     MarketEvent {
         timestamp: UnixNanos::new(ts),
         symbol_id: 0,
+        sequence: 0,
         event_type,
         price: FixedPrice::new(price_raw),
         size,

@@ -30,6 +30,7 @@ fn snapshot_event(book: &OrderBook) -> MarketEvent {
     MarketEvent {
         timestamp: book.timestamp,
         symbol_id: SYMBOL_ID,
+        sequence: 0,
         event_type: MarketEventType::BookSnapshot,
         price,
         size: total_size,
@@ -69,6 +70,7 @@ fn transition_trades(prev: &OrderBook, next: &OrderBook) -> Vec<MarketEvent> {
         MarketEvent {
             timestamp: mid_ts,
             symbol_id: SYMBOL_ID,
+            sequence: 0,
             event_type: MarketEventType::Trade,
             price: prev_bid,
             size: trade_size,
@@ -78,6 +80,7 @@ fn transition_trades(prev: &OrderBook, next: &OrderBook) -> Vec<MarketEvent> {
         MarketEvent {
             timestamp: mid_ts,
             symbol_id: SYMBOL_ID,
+            sequence: 0,
             event_type: MarketEventType::Trade,
             price: next_bid,
             size: trade_size,

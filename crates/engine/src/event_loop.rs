@@ -107,16 +107,33 @@ impl<C: Clock> EventLoop<C> {
             apply_market_event(&mut self.book, &event);
             self.events_processed += 1;
 
-            // Update stale detector
-            self.stale_detector.on_tick(now);
+            // Update stale detector with wall clock time (not event timestamp)
+            // so freshness is measured from when we actually received data
+            let wall_now = self.clock.now().as_nanos();
+            self.stale_detector.on_tick(wall_now);
 
-            // If gate was active and data is now fresh, auto-clear
-            if !self.gate.is_open() {
+            // Check sequence continuity
+            let seq_gap = self
+                .seq_detector
+                .check_sequence(event.symbol_id, event.sequence);
+            if let Some((expected, received)) = seq_gap {
+                self.gate.activate(
+                    &GateReason::SequenceGap {
+                        symbol_id: event.symbol_id,
+                        expected,
+                        received,
+                    },
+                    wall_now,
+                );
+            }
+
+            // If gate was active and data is now fresh (no stale, no seq gap), auto-clear
+            if !self.gate.is_open() && seq_gap.is_none() {
                 let stale = self
                     .stale_detector
-                    .check_stale(now, self.clock.is_market_open());
+                    .check_stale(wall_now, self.clock.is_market_open());
                 if stale.is_none() {
-                    self.gate.clear(now);
+                    self.gate.clear(wall_now);
                 }
             }
         }
@@ -166,6 +183,7 @@ mod tests {
         MarketEvent {
             timestamp: UnixNanos::new(ts),
             symbol_id: 0,
+            sequence: 0,
             event_type: MarketEventType::BidUpdate,
             price: FixedPrice::new(price_raw),
             size,
@@ -177,6 +195,7 @@ mod tests {
         MarketEvent {
             timestamp: UnixNanos::new(ts),
             symbol_id: 0,
+            sequence: 0,
             event_type: MarketEventType::AskUpdate,
             price: FixedPrice::new(price_raw),
             size,

@@ -12,6 +12,7 @@ pub enum MarketEventType {
 pub struct MarketEvent {
     pub timestamp: UnixNanos,
     pub symbol_id: u32,
+    pub sequence: u64,
     pub event_type: MarketEventType,
     pub price: FixedPrice,
     pub size: u32,

@@ -43,6 +43,7 @@ mod tests {
         let event = EngineEvent::Market(MarketEvent {
             timestamp: ts,
             symbol_id: 1,
+            sequence: 0,
             event_type: MarketEventType::Trade,
             price: FixedPrice::new(100),
             size: 10,

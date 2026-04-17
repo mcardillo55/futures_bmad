@@ -169,6 +169,7 @@ impl MessageValidator {
                             self.pending_event = Some(MarketEvent {
                                 timestamp: *timestamp,
                                 symbol_id: ask_symbol_id,
+                                sequence: 0,
                                 event_type: MarketEventType::AskUpdate,
                                 price: *price,
                                 size: *size,
@@ -219,6 +220,7 @@ impl MessageValidator {
             } => MarketEvent {
                 timestamp,
                 symbol_id,
+                sequence: 0,
                 event_type: MarketEventType::Trade,
                 price,
                 size,
@@ -232,6 +234,7 @@ impl MessageValidator {
             } => MarketEvent {
                 timestamp,
                 symbol_id,
+                sequence: 0,
                 event_type: MarketEventType::BidUpdate,
                 price,
                 size,
@@ -245,6 +248,7 @@ impl MessageValidator {
             } => MarketEvent {
                 timestamp,
                 symbol_id,
+                sequence: 0,
                 event_type: MarketEventType::AskUpdate,
                 price,
                 size,

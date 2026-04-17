@@ -101,6 +101,7 @@ mod tests {
         MarketEvent {
             timestamp: UnixNanos::new(1_000_000_000),
             symbol_id: 0,
+            sequence: 0,
             event_type: MarketEventType::Trade,
             price: FixedPrice::new(price_raw),
             size: 10,

@@ -1,6 +1,6 @@
 # Story 2.3: Market Data Gap Detection
 
-Status: review
+Status: done
 
 ## Story
 
@@ -116,3 +116,4 @@ N/A
 
 ### Change Log
 - 2026-04-17: Implemented Story 2.3 — Market Data Gap Detection (all 7 tasks)
+- 2026-04-17: Code review fixes — DST-aware market hours, wired sequence gap detection into event loop, fixed gate auto-clear race, added sequence field to MarketEvent

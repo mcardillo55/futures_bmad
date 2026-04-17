@@ -9,6 +9,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
+secrecy = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

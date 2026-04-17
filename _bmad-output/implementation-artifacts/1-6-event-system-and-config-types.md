@@ -1,6 +1,6 @@
 # Story 1.6: Event System & Config Types
 
-Status: ready-for-dev
+Status: review
 
 ## Story
 
@@ -135,6 +135,36 @@ crates/core/src/
 ## Dev Agent Record
 
 ### Agent Model Used
+Claude Opus 4.6 (1M context)
+
 ### Debug Log References
+- Fixed secrecy serde feature flag for BrokerConfig deserialization
+- Fixed test import path for MarketEventType
+
 ### Completion Notes List
+- Complete event taxonomy: Signal, Order, Lifecycle, Risk events + EngineEvent wrapper
+- Config types: TradingConfig, FeeConfig, BrokerConfig with serde Deserialize
+- Config validation: collects all errors, fee staleness checks, semantic validation
+- FixedPrice serde support (deserializes from f64, serializes to f64)
+- BrokerConfig custom Debug redacts password
+- 13 new unit tests (11 config validation + 2 EngineEvent)
+
+### Change Log
+- 2026-04-16: All tasks completed
+
 ### File List
+- Cargo.toml (modified - secrecy serde feature)
+- crates/core/Cargo.toml (modified - added secrecy)
+- crates/core/src/lib.rs (modified)
+- crates/core/src/types/fixed_price.rs (modified - added serde)
+- crates/core/src/events/mod.rs (modified)
+- crates/core/src/events/signal.rs (new)
+- crates/core/src/events/order.rs (new)
+- crates/core/src/events/lifecycle.rs (new)
+- crates/core/src/events/risk.rs (new)
+- crates/core/src/events/engine.rs (new)
+- crates/core/src/config/mod.rs (new)
+- crates/core/src/config/trading.rs (new)
+- crates/core/src/config/fees.rs (new)
+- crates/core/src/config/broker.rs (new)
+- crates/core/src/config/validation.rs (new)

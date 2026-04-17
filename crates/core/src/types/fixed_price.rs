@@ -1,3 +1,4 @@
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 /// Fixed-point price representation using quarter-ticks.
@@ -7,8 +8,23 @@ use std::fmt;
 ///
 /// All arithmetic operations use saturating behavior — they will never panic
 /// or silently wrap on overflow.
+///
+/// Serializes/deserializes as f64 for config file compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct FixedPrice(pub(crate) i64);
+
+impl Serialize for FixedPrice {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f64(self.to_f64())
+    }
+}
+
+impl<'de> Deserialize<'de> for FixedPrice {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = f64::deserialize(deserializer)?;
+        Ok(FixedPrice::from_f64(value))
+    }
+}
 
 impl FixedPrice {
     pub fn new(raw: i64) -> Self {

@@ -1,16 +1,18 @@
 use chrono::{DateTime, TimeZone, Utc};
 use futures_bmad_core::{Clock, UnixNanos};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Deterministic clock for testing. Thread-safe via AtomicU64.
 pub struct SimClock {
     current: AtomicU64,
+    market_open: AtomicBool,
 }
 
 impl SimClock {
     pub fn new(start_nanos: u64) -> Self {
         Self {
             current: AtomicU64::new(start_nanos),
+            market_open: AtomicBool::new(true),
         }
     }
 
@@ -20,6 +22,10 @@ impl SimClock {
 
     pub fn set_time(&self, time: UnixNanos) {
         self.current.store(time.as_nanos(), Ordering::SeqCst);
+    }
+
+    pub fn set_market_open(&self, open: bool) {
+        self.market_open.store(open, Ordering::SeqCst);
     }
 }
 
@@ -33,6 +39,10 @@ impl Clock for SimClock {
         let secs = (nanos / 1_000_000_000) as i64;
         let nsecs = (nanos % 1_000_000_000) as u32;
         Utc.timestamp_opt(secs, nsecs).unwrap()
+    }
+
+    fn is_market_open(&self) -> bool {
+        self.market_open.load(Ordering::SeqCst)
     }
 }
 

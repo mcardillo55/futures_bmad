@@ -13,3 +13,6 @@ crossbeam-channel = { workspace = true }
 tikv-jemallocator = { workspace = true }
 core_affinity = { workspace = true }
 bumpalo = { workspace = true }
+
+[dev-dependencies]
+futures_bmad_testkit = { workspace = true }

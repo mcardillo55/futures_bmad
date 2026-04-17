@@ -1,5 +1,5 @@
 use crate::types::UnixNanos;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 
 /// Trait for time abstraction. All code must use this instead of direct system time calls.
 ///
@@ -9,10 +9,39 @@ use chrono::{DateTime, Utc};
 pub trait Clock: Send + Sync {
     fn now(&self) -> UnixNanos;
     fn wall_clock(&self) -> DateTime<Utc>;
+    fn is_market_open(&self) -> bool;
 }
 
 /// Production clock using system time.
+/// CME market hours: Sunday 5:00 PM CT to Friday 4:00 PM CT,
+/// with daily maintenance break 4:00 PM - 5:00 PM CT (Mon-Thu).
 pub struct SystemClock;
+
+/// Check if a UTC datetime falls within CME market hours.
+/// CT = UTC-5 (CDT) or UTC-6 (CST). We use UTC-5 (CDT) as approximation.
+pub fn is_cme_market_open(utc: &DateTime<Utc>) -> bool {
+    // Convert UTC to CT (approximate as UTC-5 for CDT)
+    let ct_hour = (utc.hour() as i32 - 5).rem_euclid(24) as u32;
+    let ct_weekday = if utc.hour() < 5 {
+        // Before 5 AM UTC, CT day is previous UTC day
+        utc.weekday().pred()
+    } else {
+        utc.weekday()
+    };
+
+    use chrono::Weekday::*;
+
+    match ct_weekday {
+        // Saturday: market closed all day
+        Sat => false,
+        // Sunday: open from 5 PM CT onward
+        Sun => ct_hour >= 17,
+        // Friday: open until 4 PM CT
+        Fri => ct_hour < 16,
+        // Mon-Thu: closed during 4 PM - 5 PM CT maintenance break
+        _ => !(16..17).contains(&ct_hour),
+    }
+}
 
 impl Clock for SystemClock {
     fn now(&self) -> UnixNanos {
@@ -24,6 +53,10 @@ impl Clock for SystemClock {
 
     fn wall_clock(&self) -> DateTime<Utc> {
         Utc::now()
+    }
+
+    fn is_market_open(&self) -> bool {
+        is_cme_market_open(&Utc::now())
     }
 }
 

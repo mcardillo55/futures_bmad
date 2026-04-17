@@ -338,6 +338,7 @@ dependencies = [
  "crossbeam-channel",
  "futures_bmad_broker",
  "futures_bmad_core",
+ "futures_bmad_testkit",
  "rtrb",
  "tikv-jemallocator",
  "tokio",

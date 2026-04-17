@@ -1,8 +1,12 @@
-use futures_core::{FixedPrice, Level, OrderBook};
+use futures_bmad_core::{FixedPrice, Level, OrderBook};
 use proptest::prelude::*;
 
 fn arb_level(price_raw: i64, size: u32) -> Level {
-    Level { price: FixedPrice::new(price_raw), size, order_count: 1 }
+    Level {
+        price: FixedPrice::new(price_raw),
+        size,
+        order_count: 1,
+    }
 }
 
 proptest! {

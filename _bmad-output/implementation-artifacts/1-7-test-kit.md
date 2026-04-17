@@ -1,6 +1,6 @@
 # Story 1.7: Test Kit
 
-Status: review
+Status: done
 
 ## Story
 
@@ -143,3 +143,8 @@ Claude Opus 4.6 (1M context)
 - crates/testkit/src/market_gen.rs (new)
 - crates/testkit/src/scenario.rs (new)
 - crates/testkit/src/assertions.rs (new)
+
+### Review Findings
+- [x] [Review][Patch] MockBrokerAdapter::cancel_order does not record cancellations [mock_broker.rs:76] — spec task 3.4 says "records cancellation" but the order_id is discarded (_order_id) with no side effect. Add a cancelled_orders: Vec<u64> field and push into it. — fixed in review patch
+- [x] [Review][Patch] PartialFill behavior is identical to Fill [mock_broker.rs:66] — MockBehavior::PartialFill(u32) is matched in the same arm as Fill, the u32 quantity payload is never used. Should produce a distinct result or at least document that downstream fill simulation is deferred. — fixed in review patch
+- [x] [Review][Decision] Scenario.events is always empty — all Scenario factory methods set events: Vec::new(). The struct declares pub events: Vec<MarketEvent> but no factory populates it. Decide whether to populate events in factory methods now or defer to a later story. — fixed in review patch

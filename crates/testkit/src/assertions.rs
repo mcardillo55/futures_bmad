@@ -1,4 +1,4 @@
-use futures_core::FixedPrice;
+use futures_bmad_core::FixedPrice;
 
 /// Check if two prices are within epsilon quarter-ticks of each other.
 pub fn price_eq_epsilon(actual: FixedPrice, expected: FixedPrice, epsilon_ticks: i64) -> bool {

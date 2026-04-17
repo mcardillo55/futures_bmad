@@ -9,7 +9,11 @@ pub struct OrderBookBuilder {
 
 impl OrderBookBuilder {
     pub fn new() -> Self {
-        Self { bids: Vec::new(), asks: Vec::new(), timestamp: UnixNanos::default() }
+        Self {
+            bids: Vec::new(),
+            asks: Vec::new(),
+            timestamp: UnixNanos::default(),
+        }
     }
 
     pub fn bid(mut self, price: f64, size: u32) -> Self {
@@ -112,20 +116,32 @@ mod tests {
 
         assert_eq!(book.bid_count, 2);
         assert_eq!(book.ask_count, 2);
-        assert_eq!(book.best_bid().unwrap().price, FixedPrice::from_f64(4500.00).unwrap());
-        assert_eq!(book.best_ask().unwrap().price, FixedPrice::from_f64(4500.25).unwrap());
+        assert_eq!(
+            book.best_bid().unwrap().price,
+            FixedPrice::from_f64(4500.00).unwrap()
+        );
+        assert_eq!(
+            book.best_ask().unwrap().price,
+            FixedPrice::from_f64(4500.25).unwrap()
+        );
     }
 
     #[test]
     #[should_panic(expected = "bids must be in descending")]
     fn non_monotonic_bids_panic() {
-        OrderBookBuilder::new().bid(4500.00, 50).bid(4500.25, 30).build();
+        OrderBookBuilder::new()
+            .bid(4500.00, 50)
+            .bid(4500.25, 30)
+            .build();
     }
 
     #[test]
     #[should_panic(expected = "asks must be in ascending")]
     fn non_monotonic_asks_panic() {
-        OrderBookBuilder::new().ask(4500.50, 40).ask(4500.25, 20).build();
+        OrderBookBuilder::new()
+            .ask(4500.50, 40)
+            .ask(4500.25, 20)
+            .build();
     }
 
     #[test]

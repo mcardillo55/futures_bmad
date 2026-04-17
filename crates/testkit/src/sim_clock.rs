@@ -1,5 +1,5 @@
 use chrono::{DateTime, TimeZone, Utc};
-use futures_core::{Clock, UnixNanos};
+use futures_bmad_core::{Clock, UnixNanos};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Deterministic clock for testing. Thread-safe via AtomicU64.
@@ -9,7 +9,9 @@ pub struct SimClock {
 
 impl SimClock {
     pub fn new(start_nanos: u64) -> Self {
-        Self { current: AtomicU64::new(start_nanos) }
+        Self {
+            current: AtomicU64::new(start_nanos),
+        }
     }
 
     pub fn advance_by(&self, nanos: u64) {

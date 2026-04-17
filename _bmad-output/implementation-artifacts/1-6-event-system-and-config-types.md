@@ -1,6 +1,6 @@
 # Story 1.6: Event System & Config Types
 
-Status: review
+Status: done
 
 ## Story
 
@@ -168,3 +168,11 @@ Claude Opus 4.6 (1M context)
 - crates/core/src/config/fees.rs (new)
 - crates/core/src/config/broker.rs (new)
 - crates/core/src/config/validation.rs (new)
+
+### Review Findings
+- [x] [Review][Decision] TradingConfig fields not validated — `symbol`, `session_start`, `session_end` are not checked for emptiness or format validity; decide whether validation should be added now or deferred to config-loading story — fixed in review patch
+- [x] [Review][Decision] Future effective_date not rejected — FeeConfig allows `effective_date` set in the future (e.g. 2099-01-01) without warning; decide if this should be guarded — fixed in review patch
+- [x] [Review][Patch] Unparseable effective_date silently passes [crates/core/src/config/validation.rs:80] — if `NaiveDate::parse_from_str` fails, staleness check is skipped entirely; add an `InvalidDateFormat` error variant for the else branch — fixed in review patch
+- [x] [Review][Patch] NaN/Infinity f64 values bypass validation [crates/core/src/config/validation.rs:67-78] — `NaN < 0.0` is false, so NaN fees and NaN `edge_multiple_threshold` silently pass; add `f64::is_finite()` guards — fixed in review patch
+- [x] [Review][Defer] ConfigValidationError missing std::error::Error impl [crates/core/src/config/validation.rs:3] — deferred, pre-existing pattern; add `impl std::error::Error` when integrating with anyhow/thiserror
+- [x] [Review][Defer] FixedPrice::from_f64 accepts non-finite values [crates/core/src/types/fixed_price.rs:53] — deferred, pre-existing; add validation in from_f64 or deserializer

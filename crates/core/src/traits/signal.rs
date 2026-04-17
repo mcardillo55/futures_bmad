@@ -4,7 +4,7 @@ use crate::traits::clock::Clock;
 use crate::types::UnixNanos;
 
 /// Snapshot of a signal's state for deterministic replay and audit.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SignalSnapshot {
     pub name: &'static str,
     pub value: Option<f64>,

@@ -1,4 +1,4 @@
-use futures_core::OrderState;
+use futures_bmad_core::OrderState;
 use proptest::prelude::*;
 
 fn arb_order_state() -> impl Strategy<Value = OrderState> {

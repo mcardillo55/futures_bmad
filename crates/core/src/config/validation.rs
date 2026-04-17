@@ -24,7 +24,9 @@ impl std::fmt::Display for ConfigValidationError {
         match self {
             Self::ZeroPositionSize => write!(f, "max_position_size must be > 0"),
             Self::ZeroConsecutiveLosses => write!(f, "max_consecutive_losses must be > 0"),
-            Self::EdgeMultipleTooLow(v) => write!(f, "edge_multiple_threshold ({v}) must be >= 1.0"),
+            Self::EdgeMultipleTooLow(v) => {
+                write!(f, "edge_multiple_threshold ({v}) must be >= 1.0")
+            }
             Self::NegativeDailyLoss => write!(f, "max_daily_loss must be >= 0"),
             Self::NegativeFee(name) => write!(f, "{name} must be >= 0"),
             Self::NonFiniteValue(name) => write!(f, "{name} must be a finite number"),
@@ -61,9 +63,13 @@ pub fn validate_trading_config(config: &TradingConfig) -> Result<(), Vec<ConfigV
         errors.push(ConfigValidationError::ZeroConsecutiveLosses);
     }
     if !config.edge_multiple_threshold.is_finite() {
-        errors.push(ConfigValidationError::NonFiniteValue("edge_multiple_threshold".into()));
+        errors.push(ConfigValidationError::NonFiniteValue(
+            "edge_multiple_threshold".into(),
+        ));
     } else if config.edge_multiple_threshold < 1.0 {
-        errors.push(ConfigValidationError::EdgeMultipleTooLow(config.edge_multiple_threshold));
+        errors.push(ConfigValidationError::EdgeMultipleTooLow(
+            config.edge_multiple_threshold,
+        ));
     }
     if config.max_daily_loss.raw() < 0 {
         errors.push(ConfigValidationError::NegativeDailyLoss);
@@ -75,7 +81,9 @@ pub fn validate_trading_config(config: &TradingConfig) -> Result<(), Vec<ConfigV
     // Validate session time format (HH:MM)
     let time_re = |s: &str| -> bool {
         let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() != 2 { return false; }
+        if parts.len() != 2 {
+            return false;
+        }
         let h = parts[0].parse::<u32>().ok();
         let m = parts[1].parse::<u32>().ok();
         matches!((h, m), (Some(h), Some(m)) if h < 24 && m < 60)
@@ -97,7 +105,11 @@ pub fn validate_trading_config(config: &TradingConfig) -> Result<(), Vec<ConfigV
         });
     }
 
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 pub fn validate_fee_config(config: &FeeConfig) -> Result<(), Vec<ConfigValidationError>> {
@@ -129,11 +141,17 @@ pub fn validate_fee_config(config: &FeeConfig) -> Result<(), Vec<ConfigValidatio
             }
         }
         Err(_) => {
-            errors.push(ConfigValidationError::InvalidDateFormat(config.effective_date.clone()));
+            errors.push(ConfigValidationError::InvalidDateFormat(
+                config.effective_date.clone(),
+            ));
         }
     }
 
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 pub fn validate_broker_config(config: &BrokerConfig) -> Result<(), Vec<ConfigValidationError>> {
@@ -149,16 +167,26 @@ pub fn validate_broker_config(config: &BrokerConfig) -> Result<(), Vec<ConfigVal
         errors.push(ConfigValidationError::EmptyField("user".into()));
     }
     if config.reconnect_delay_ms == 0 {
-        errors.push(ConfigValidationError::ZeroTimeout("reconnect_delay_ms".into()));
+        errors.push(ConfigValidationError::ZeroTimeout(
+            "reconnect_delay_ms".into(),
+        ));
     }
     if config.heartbeat_interval_ms == 0 {
-        errors.push(ConfigValidationError::ZeroTimeout("heartbeat_interval_ms".into()));
+        errors.push(ConfigValidationError::ZeroTimeout(
+            "heartbeat_interval_ms".into(),
+        ));
     }
     if config.order_timeout_ms == 0 {
-        errors.push(ConfigValidationError::ZeroTimeout("order_timeout_ms".into()));
+        errors.push(ConfigValidationError::ZeroTimeout(
+            "order_timeout_ms".into(),
+        ));
     }
 
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 pub fn validate_all(
@@ -176,7 +204,11 @@ pub fn validate_all(
     if let Err(errs) = validate_broker_config(broker) {
         all_errors.extend(errs);
     }
-    if all_errors.is_empty() { Ok(()) } else { Err(all_errors) }
+    if all_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(all_errors)
+    }
 }
 
 #[cfg(test)]
@@ -248,7 +280,10 @@ mod tests {
         let mut config = valid_trading_config();
         config.edge_multiple_threshold = 0.5;
         let errs = validate_trading_config(&config).unwrap_err();
-        assert!(matches!(errs[0], ConfigValidationError::EdgeMultipleTooLow(_)));
+        assert!(matches!(
+            errs[0],
+            ConfigValidationError::EdgeMultipleTooLow(_)
+        ));
     }
 
     #[test]
@@ -256,31 +291,43 @@ mod tests {
         let mut config = valid_fee_config();
         config.exchange_fee = -1.0;
         let errs = validate_fee_config(&config).unwrap_err();
-        assert!(matches!(&errs[0], ConfigValidationError::NegativeFee(name) if name == "exchange_fee"));
+        assert!(
+            matches!(&errs[0], ConfigValidationError::NegativeFee(name) if name == "exchange_fee")
+        );
     }
 
     #[test]
     fn fee_staleness_warn_at_31_days() {
         let mut config = valid_fee_config();
-        let stale_date = (chrono::Utc::now() - chrono::Duration::days(31)).format("%Y-%m-%d").to_string();
+        let stale_date = (chrono::Utc::now() - chrono::Duration::days(31))
+            .format("%Y-%m-%d")
+            .to_string();
         config.effective_date = stale_date;
         let errs = validate_fee_config(&config).unwrap_err();
-        assert!(matches!(&errs[0], ConfigValidationError::FeeScheduleStale { days_old } if *days_old == 31));
+        assert!(
+            matches!(&errs[0], ConfigValidationError::FeeScheduleStale { days_old } if *days_old == 31)
+        );
     }
 
     #[test]
     fn fee_staleness_block_at_61_days() {
         let mut config = valid_fee_config();
-        let expired_date = (chrono::Utc::now() - chrono::Duration::days(61)).format("%Y-%m-%d").to_string();
+        let expired_date = (chrono::Utc::now() - chrono::Duration::days(61))
+            .format("%Y-%m-%d")
+            .to_string();
         config.effective_date = expired_date;
         let errs = validate_fee_config(&config).unwrap_err();
-        assert!(matches!(&errs[0], ConfigValidationError::FeeScheduleExpired { days_old } if *days_old == 61));
+        assert!(
+            matches!(&errs[0], ConfigValidationError::FeeScheduleExpired { days_old } if *days_old == 61)
+        );
     }
 
     #[test]
     fn fee_at_29_days_passes() {
         let mut config = valid_fee_config();
-        let ok_date = (chrono::Utc::now() - chrono::Duration::days(29)).format("%Y-%m-%d").to_string();
+        let ok_date = (chrono::Utc::now() - chrono::Duration::days(29))
+            .format("%Y-%m-%d")
+            .to_string();
         config.effective_date = ok_date;
         assert!(validate_fee_config(&config).is_ok());
     }
@@ -299,7 +346,9 @@ mod tests {
         let mut config = valid_broker_config();
         config.order_timeout_ms = 0;
         let errs = validate_broker_config(&config).unwrap_err();
-        assert!(matches!(&errs[0], ConfigValidationError::ZeroTimeout(name) if name == "order_timeout_ms"));
+        assert!(
+            matches!(&errs[0], ConfigValidationError::ZeroTimeout(name) if name == "order_timeout_ms")
+        );
     }
 
     #[test]

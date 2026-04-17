@@ -35,6 +35,10 @@ impl Position {
     }
 
     pub fn apply_fill(&mut self, fill: &FillEvent) {
+        if fill.fill_size == 0 {
+            return;
+        }
+
         if self.quantity == 0 {
             // Opening a new position
             self.side = Some(fill.side);
@@ -49,7 +53,7 @@ impl Position {
                 .avg_entry_price
                 .saturating_mul(self.quantity as i64)
                 .saturating_add(fill.fill_price.saturating_mul(fill.fill_size as i64));
-            let new_qty = self.quantity + fill.fill_size;
+            let new_qty = self.quantity.saturating_add(fill.fill_size);
             self.avg_entry_price = FixedPrice::new(total_cost.raw() / new_qty as i64);
             self.quantity = new_qty;
         } else {
@@ -79,7 +83,9 @@ impl Position {
             Some(Side::Sell) => -1i64,
             None => 0i64,
         };
-        self.unrealized_pnl = diff.saturating_mul(self.quantity as i64).saturating_mul(direction);
+        self.unrealized_pnl = diff
+            .saturating_mul(self.quantity as i64)
+            .saturating_mul(direction);
     }
 }
 

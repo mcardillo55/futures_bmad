@@ -40,8 +40,10 @@ impl OrderBook {
         }
     }
 
+    /// Update bid at `index`. Callers must populate levels contiguously from index 0.
+    /// Silently ignores out-of-bounds or non-contiguous updates.
     pub fn update_bid(&mut self, index: usize, level: Level) {
-        if index >= BOOK_DEPTH {
+        if index >= BOOK_DEPTH || index > self.bid_count as usize {
             return;
         }
         self.bids[index] = level;
@@ -50,8 +52,10 @@ impl OrderBook {
         }
     }
 
+    /// Update ask at `index`. Callers must populate levels contiguously from index 0.
+    /// Silently ignores out-of-bounds or non-contiguous updates.
     pub fn update_ask(&mut self, index: usize, level: Level) {
-        if index >= BOOK_DEPTH {
+        if index >= BOOK_DEPTH || index > self.ask_count as usize {
             return;
         }
         self.asks[index] = level;
@@ -61,11 +65,19 @@ impl OrderBook {
     }
 
     pub fn best_bid(&self) -> Option<&Level> {
-        if self.bid_count > 0 { Some(&self.bids[0]) } else { None }
+        if self.bid_count > 0 {
+            Some(&self.bids[0])
+        } else {
+            None
+        }
     }
 
     pub fn best_ask(&self) -> Option<&Level> {
-        if self.ask_count > 0 { Some(&self.asks[0]) } else { None }
+        if self.ask_count > 0 {
+            Some(&self.asks[0])
+        } else {
+            None
+        }
     }
 
     pub fn mid_price(&self) -> Option<FixedPrice> {
@@ -90,7 +102,7 @@ impl OrderBook {
             Some(s) => s,
             None => return false,
         };
-        if spread.raw() > max_spread_threshold.raw() {
+        if spread.raw() < 0 || spread.raw() > max_spread_threshold.raw() {
             return false;
         }
 
@@ -121,7 +133,11 @@ mod tests {
     use super::*;
 
     fn make_level(price_raw: i64, size: u32) -> Level {
-        Level { price: FixedPrice::new(price_raw), size, order_count: 1 }
+        Level {
+            price: FixedPrice::new(price_raw),
+            size,
+            order_count: 1,
+        }
     }
 
     fn make_valid_book() -> OrderBook {

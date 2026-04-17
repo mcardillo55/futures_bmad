@@ -9,10 +9,10 @@ repository = "https://github.com/futures-bmad/futures-trading"
 
 [workspace.dependencies]
 # Internal crates
-futures_core = { path = "crates/core" }
-futures_broker = { path = "crates/broker" }
-futures_engine = { path = "crates/engine" }
-futures_testkit = { path = "crates/testkit" }
+futures_bmad_core = { path = "crates/core" }
+futures_bmad_broker = { path = "crates/broker" }
+futures_bmad_engine = { path = "crates/engine" }
+futures_bmad_testkit = { path = "crates/testkit" }
 
 # Async runtime
 tokio = { version = "1.51.1", features = ["full"] }

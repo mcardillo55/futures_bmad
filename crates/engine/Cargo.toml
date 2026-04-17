@@ -1,11 +1,11 @@
 [package]
-name = "futures_engine"
+name = "futures_bmad_engine"
 version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-futures_core = { workspace = true }
-futures_broker = { workspace = true }
+futures_bmad_core = { workspace = true }
+futures_bmad_broker = { workspace = true }
 tokio = { workspace = true }
 rtrb = { workspace = true }
 tracing = { workspace = true }

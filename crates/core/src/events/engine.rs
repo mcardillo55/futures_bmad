@@ -1,6 +1,6 @@
 use super::{
-    CircuitBreakerEvent, ConnectionStateChange, FillEvent, HeartbeatEvent, MarketEvent,
-    OrderEvent, RegimeTransition, SignalEvent,
+    CircuitBreakerEvent, ConnectionStateChange, FillEvent, HeartbeatEvent, MarketEvent, OrderEvent,
+    RegimeTransition, SignalEvent,
 };
 use crate::types::UnixNanos;
 
@@ -54,7 +54,10 @@ mod tests {
     #[test]
     fn timestamp_from_heartbeat() {
         let ts = UnixNanos::new(99999);
-        let event = EngineEvent::Heartbeat(HeartbeatEvent { timestamp: ts, sequence: 1 });
+        let event = EngineEvent::Heartbeat(HeartbeatEvent {
+            timestamp: ts,
+            sequence: 1,
+        });
         assert_eq!(event.timestamp(), ts);
     }
 }

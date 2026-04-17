@@ -91,7 +91,11 @@ fn bankers_round(x: f64) -> i64 {
 
     if (frac - 0.5).abs() < f64::EPSILON {
         // Exactly half: round to even
-        if floor_i % 2 == 0 { floor_i } else { floor_i + 1 }
+        if floor_i % 2 == 0 {
+            floor_i
+        } else {
+            floor_i + 1
+        }
     } else {
         x.round() as i64
     }

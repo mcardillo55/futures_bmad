@@ -53,12 +53,21 @@ impl OrderState {
         if self.can_transition_to(next) {
             Ok(next)
         } else {
-            Err(OrderStateError { from: *self, to: next })
+            Err(OrderStateError {
+                from: *self,
+                to: next,
+            })
         }
     }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self, OrderState::Filled | OrderState::Rejected | OrderState::Cancelled | OrderState::Resolved)
+        matches!(
+            self,
+            OrderState::Filled
+                | OrderState::Rejected
+                | OrderState::Cancelled
+                | OrderState::Resolved
+        )
     }
 }
 
@@ -77,6 +86,8 @@ pub enum OrderParamsError {
     MissingPrice,
     #[error("Market orders must not have a price")]
     UnexpectedPrice,
+    #[error("quantity must be > 0")]
+    ZeroQuantity,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -90,6 +101,9 @@ pub struct OrderParams {
 
 impl OrderParams {
     pub fn validate(&self) -> Result<(), OrderParamsError> {
+        if self.quantity == 0 {
+            return Err(OrderParamsError::ZeroQuantity);
+        }
         match self.order_type {
             OrderType::Market => {
                 if self.price.is_some() {
@@ -127,6 +141,8 @@ pub enum BracketOrderError {
     StopLossNotStop,
     #[error("take_profit and stop_loss must be opposite side to entry")]
     InconsistentSides,
+    #[error("invalid order params: {0}")]
+    InvalidParams(#[from] OrderParamsError),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,6 +158,10 @@ impl BracketOrder {
         take_profit: OrderParams,
         stop_loss: OrderParams,
     ) -> Result<Self, BracketOrderError> {
+        entry.validate()?;
+        take_profit.validate()?;
+        stop_loss.validate()?;
+
         if entry.order_type != OrderType::Market {
             return Err(BracketOrderError::EntryNotMarket);
         }
@@ -160,7 +180,11 @@ impl BracketOrder {
             return Err(BracketOrderError::InconsistentSides);
         }
 
-        Ok(Self { entry, take_profit, stop_loss })
+        Ok(Self {
+            entry,
+            take_profit,
+            stop_loss,
+        })
     }
 }
 
@@ -203,7 +227,10 @@ mod tests {
         };
         assert!(market.validate().is_ok());
 
-        let bad_market = OrderParams { price: Some(FixedPrice::new(100)), ..market };
+        let bad_market = OrderParams {
+            price: Some(FixedPrice::new(100)),
+            ..market
+        };
         assert!(bad_market.validate().is_err());
 
         let limit = OrderParams {
@@ -213,7 +240,11 @@ mod tests {
         };
         assert!(limit.validate().is_ok());
 
-        let bad_limit = OrderParams { order_type: OrderType::Limit, price: None, ..market };
+        let bad_limit = OrderParams {
+            order_type: OrderType::Limit,
+            price: None,
+            ..market
+        };
         assert!(bad_limit.validate().is_err());
     }
 
@@ -244,11 +275,24 @@ mod tests {
         assert!(BracketOrder::new(entry, tp, sl).is_ok());
 
         // Wrong entry type
-        let bad_entry = OrderParams { order_type: OrderType::Limit, price: Some(FixedPrice::new(100)), ..entry };
-        assert!(matches!(BracketOrder::new(bad_entry, tp, sl), Err(BracketOrderError::EntryNotMarket)));
+        let bad_entry = OrderParams {
+            order_type: OrderType::Limit,
+            price: Some(FixedPrice::new(100)),
+            ..entry
+        };
+        assert!(matches!(
+            BracketOrder::new(bad_entry, tp, sl),
+            Err(BracketOrderError::EntryNotMarket)
+        ));
 
         // Wrong sides
-        let bad_tp = OrderParams { side: Side::Buy, ..tp };
-        assert!(matches!(BracketOrder::new(entry, bad_tp, sl), Err(BracketOrderError::InconsistentSides)));
+        let bad_tp = OrderParams {
+            side: Side::Buy,
+            ..tp
+        };
+        assert!(matches!(
+            BracketOrder::new(entry, bad_tp, sl),
+            Err(BracketOrderError::InconsistentSides)
+        ));
     }
 }

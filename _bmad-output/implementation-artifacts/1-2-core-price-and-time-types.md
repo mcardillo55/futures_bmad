@@ -1,6 +1,6 @@
 # Story 1.2: Core Price & Time Types
 
-Status: review
+Status: done
 
 ## Story
 
@@ -68,6 +68,10 @@ So that all price arithmetic uses integer-only FixedPrice with saturating behavi
 - [x] 7.1: Test chrono DateTime round-trip conversion
 - [x] 7.2: Test ordering of timestamps
 - [x] 7.3: Test default value
+
+### Review Findings
+- [x] [Review][Patch] UnixNanos::to_datetime panics on large u64 values [unix_nanos.rs:23] -- `(self.0 / 1_000_000_000) as i64` wraps for u64 > i64::MAX, then `.unwrap()` on `timestamp_opt` can panic. Replace `.unwrap()` with `.single()` or return `Option<DateTime<Utc>>`, or clamp the seconds value. The "never panic" design principle from the architecture extends beyond just FixedPrice. — fixed in review patch
+- [x] [Review][Decision] Bar struct missing PartialEq/Eq derives [bar.rs:4] -- Spec only requires Debug/Clone/Copy, but downstream stories will almost certainly need equality comparison for tests and logic. Decide now whether to add PartialEq/Eq to Bar (trivial, no cost). — fixed in review patch
 
 ## Dev Notes
 

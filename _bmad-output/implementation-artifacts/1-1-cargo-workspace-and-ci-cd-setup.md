@@ -1,6 +1,6 @@
 # Story 1.1: Cargo Workspace & CI/CD Setup
 
-Status: review
+Status: done
 
 ## Story
 
@@ -118,6 +118,13 @@ N/A - clean implementation with no issues
 - Edition 2024, toolchain 1.95.0 stable
 - CI workflow: fmt check, clippy, nextest, audit on push/PR to main
 - All verification passed: build, clippy (zero warnings), tests (zero tests, zero failures)
+
+### Review Findings
+
+- [x] [Review][Decision] `futures_core` crate name collides with `futures-core` ecosystem crate — The workspace crate `futures_core` shares its Rust identifier with the widely-used `futures-core` crate (part of the `futures` ecosystem). This can cause confusion in `use` statements and may cause issues if any dependency transitively depends on `futures-core`. Consider renaming to `futures_bmad_core` or similar. — fixed in review patch
+- [x] [Review][Patch] CI clippy missing `--all-targets` flag [.github/workflows/ci.yml:45] — `cargo clippy --workspace` does not lint test, bench, or example targets. Should be `cargo clippy --workspace --all-targets -- -D warnings` to catch warnings in test code. — fixed in review patch
+- [x] [Review][Patch] CI missing `--locked` flag for reproducible builds [.github/workflows/ci.yml:48] — `cargo nextest run --workspace` (and build steps) should use `--locked` to ensure CI uses exact Cargo.lock versions and fails if Cargo.lock is stale. — fixed in review patch
+- [x] [Review][Defer] jemalloc `#[global_allocator]` needs binary crate [crates/engine/Cargo.toml:14] — `tikv-jemallocator` is declared as a library dependency but `#[global_allocator]` must be set in a binary crate, not a library. Deferred until binary crate is created.
 
 ### Change Log
 - 2026-04-16: Story implemented - all tasks completed

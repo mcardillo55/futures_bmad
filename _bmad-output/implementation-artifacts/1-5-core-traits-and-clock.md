@@ -1,6 +1,6 @@
 # Story 1.5: Core Traits & Clock
 
-Status: review
+Status: done
 
 ## Story
 
@@ -117,6 +117,13 @@ N/A
 
 ### Change Log
 - 2026-04-16: All tasks completed
+
+### Review Findings
+
+- [x] [Review][Decision] async_trait vs native async fn in traits -- Spec task 5.4 notes Rust 1.95 supports native async fn in traits. Implementation chose async_trait for dyn-dispatch compatibility. Confirm this is the desired approach or switch to native async traits if dyn BrokerAdapter is not needed. — fixed in review patch
+- [x] [Review][Patch] SignalSnapshot missing PartialEq derive [crates/core/src/traits/signal.rs:8] -- SignalSnapshot derives Debug, Clone, Copy but not PartialEq. This makes assert_eq! impossible in tests. Add PartialEq derive (f64 supports PartialEq but not Eq, so only PartialEq). — fixed in review patch
+- [x] [Review][Defer] UnixNanos::from silently zeroes out-of-range dates [crates/core/src/types/unix_nanos.rs:29] -- deferred, pre-existing. timestamp_nanos_opt() returns None for far-future dates; unwrap_or(0) silently produces epoch zero.
+- [x] [Review][Defer] UnixNanos::from wraps negative timestamps [crates/core/src/types/unix_nanos.rs:29] -- deferred, pre-existing. Negative i64 from pre-epoch DateTime cast to u64 via `as` wraps to large values.
 
 ### File List
 - Cargo.toml (modified - added async-trait)

@@ -1,5 +1,5 @@
 use crate::book_builder::OrderBookBuilder;
-use futures_core::OrderBook;
+use futures_bmad_core::OrderBook;
 
 /// Normal trading conditions: tight spread, deep book around ES ~4500.
 pub fn normal_trading_book() -> OrderBook {

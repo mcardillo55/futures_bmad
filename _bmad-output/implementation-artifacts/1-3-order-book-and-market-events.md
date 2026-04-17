@@ -1,6 +1,6 @@
 # Story 1.3: Order Book & Market Events
 
-Status: review
+Status: done
 
 ## Story
 
@@ -45,6 +45,10 @@ So that market data can be processed on the hot path without heap allocations.
 
 ### Task 7: Write unit tests for OrderBook methods
 - [x] 7.1-7.5: Unit tests for empty, update, mid_price, is_tradeable, out-of-bounds
+
+### Review Findings
+- [x] [Review][Patch] Crossed book passes is_tradeable — when best_bid > best_ask (crossed book), spread() returns negative FixedPrice and the spread threshold check does not reject it. Add `if spread.raw() < 0 { return false; }` before the threshold comparison. [crates/core/src/order_book/book.rs:93] — fixed in review patch
+- [x] [Review][Decision] update_bid/update_ask gap semantics — calling update_bid(5, level) without populating 0-4 sets bid_count=6, leaving zeroed levels in between. Callers must populate levels contiguously from index 0. Decide whether to (a) document this contract explicitly, (b) enforce contiguity by rejecting index > current count, or (c) accept current behavior as-is since is_tradeable catches invalid books. — fixed in review patch
 
 ## Dev Notes
 

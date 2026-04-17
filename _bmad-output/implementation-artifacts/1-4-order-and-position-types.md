@@ -1,6 +1,6 @@
 # Story 1.4: Order & Position Types
 
-Status: review
+Status: done
 
 ## Story
 
@@ -120,6 +120,12 @@ N/A
 
 ### Change Log
 - 2026-04-16: All tasks completed
+
+### Review Findings
+- [x] [Review][Patch] u32 overflow in Position::apply_fill same-side branch [position.rs:52] — `self.quantity + fill.fill_size` can panic on overflow; use `saturating_add` or `checked_add` — fixed in review patch
+- [x] [Review][Patch] Zero-size fill creates inconsistent Position state [position.rs:38-43] — `fill_size == 0` sets `side = Some(...)` with `quantity = 0`; guard with `assert!(fill.fill_size > 0)` or early return — fixed in review patch
+- [x] [Review][Patch] OrderParams::validate does not reject zero quantity [order.rs:92] — a zero-quantity order passes validation; add `quantity == 0` check — fixed in review patch
+- [x] [Review][Decision] BracketOrder::new does not validate component OrderParams — constructor checks type/side consistency but never calls `validate()` on entry/tp/sl; could allow e.g. a Stop with no price. Decide: call validate() internally, or document that caller must validate? — fixed in review patch
 
 ### File List
 - crates/core/src/lib.rs (modified)

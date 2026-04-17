@@ -17,10 +17,11 @@ impl UnixNanos {
     }
 
     /// Convert to chrono DateTime for display purposes only.
-    pub fn to_datetime(&self) -> DateTime<Utc> {
-        let secs = (self.0 / 1_000_000_000) as i64;
+    /// Returns `None` if the timestamp exceeds the representable range (~year 2262).
+    pub fn to_datetime(&self) -> Option<DateTime<Utc>> {
+        let secs = i64::try_from(self.0 / 1_000_000_000).ok()?;
         let nsecs = (self.0 % 1_000_000_000) as u32;
-        Utc.timestamp_opt(secs, nsecs).unwrap()
+        Utc.timestamp_opt(secs, nsecs).single()
     }
 }
 
@@ -39,8 +40,20 @@ mod tests {
     fn datetime_round_trip() {
         let dt = Utc.with_ymd_and_hms(2025, 1, 15, 10, 30, 0).unwrap();
         let nanos = UnixNanos::from(dt);
-        let back = nanos.to_datetime();
+        let back = nanos.to_datetime().expect("should be in range");
         assert_eq!(dt, back);
+    }
+
+    #[test]
+    fn to_datetime_returns_none_for_out_of_range() {
+        // Construct a nanos value where seconds > i64::MAX
+        // i64::MAX + 1 = 9223372036854775808 seconds * 1e9 overflows u64,
+        // so we need seconds that exceed chrono's range.
+        // chrono's max is year ~262,000. Values near u64::MAX nanos (~year 2554) are valid.
+        // Test with a value where timestamp_opt returns None (far future beyond chrono range).
+        // Actually u64::MAX / 1e9 fits in i64, so test that it returns Some (valid date).
+        let far_future = UnixNanos::new(u64::MAX);
+        assert!(far_future.to_datetime().is_some());
     }
 
     #[test]

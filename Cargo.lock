@@ -303,19 +303,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "futures_broker"
+name = "futures_bmad_broker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "futures_core",
+ "async-trait",
+ "futures_bmad_core",
  "rithmic-rs",
+ "secrecy",
  "thiserror",
  "tokio",
  "tracing",
 ]
 
 [[package]]
-name = "futures_core"
+name = "futures_bmad_core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -328,14 +330,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "futures_engine"
+name = "futures_bmad_engine"
 version = "0.1.0"
 dependencies = [
  "bumpalo",
  "core_affinity",
  "crossbeam-channel",
- "futures_broker",
- "futures_core",
+ "futures_bmad_broker",
+ "futures_bmad_core",
  "rtrb",
  "tikv-jemallocator",
  "tokio",
@@ -343,12 +345,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "futures_testkit"
+name = "futures_bmad_testkit"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
- "futures_core",
+ "futures_bmad_core",
  "proptest",
  "tokio",
 ]

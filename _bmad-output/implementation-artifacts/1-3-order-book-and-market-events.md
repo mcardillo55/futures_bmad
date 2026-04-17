@@ -1,6 +1,6 @@
 # Story 1.3: Order Book & Market Events
 
-Status: ready-for-dev
+Status: review
 
 ## Story
 
@@ -24,52 +24,27 @@ So that market data can be processed on the hot path without heap allocations.
 ## Tasks / Subtasks
 
 ### Task 1: Create module structure (AC: types exist in core)
-- 1.1: Create `crates/core/src/order_book/mod.rs` with public module declaration for `order_book`
-- 1.2: Create `crates/core/src/events/mod.rs` with public module declaration for `market`
-- 1.3: Update `crates/core/src/lib.rs` to declare `pub mod order_book` and `pub mod events`
+- [x] 1.1: Create `crates/core/src/order_book/mod.rs` with public module declaration
+- [x] 1.2: Create `crates/core/src/events/mod.rs` with public module declaration for `market`
+- [x] 1.3: Update `crates/core/src/lib.rs` to declare `pub mod order_book` and `pub mod events`
 
 ### Task 2: Implement Level struct (AC: Level fields and derives)
-- 2.1: In `crates/core/src/order_book/order_book.rs`, define `#[derive(Debug, Clone, Copy)] pub struct Level { pub price: FixedPrice, pub size: u32, pub order_count: u16 }`
-- 2.2: Implement `Level::empty() -> Level` returning zeroed fields
-- 2.3: Implement `Default` for `Level`
+- [x] 2.1-2.3: Level struct with price, size, order_count, empty(), Default
 
 ### Task 3: Implement OrderBook struct (AC: fixed arrays, stack-allocated, all methods)
-- 3.1: Define `OrderBook` with `bids: [Level; 10]`, `asks: [Level; 10]`, `bid_count: u8`, `ask_count: u8`, `timestamp: UnixNanos`
-- 3.2: Implement `OrderBook::empty() -> OrderBook` with all-zero initialization
-- 3.3: Implement `update_bid(index: usize, level: Level)` — updates bid at index, adjusts `bid_count` if needed. Bounds-check index < 10.
-- 3.4: Implement `update_ask(index: usize, level: Level)` — updates ask at index, adjusts `ask_count` if needed. Bounds-check index < 10.
-- 3.5: Implement `best_bid() -> Option<&Level>` — returns `bids[0]` if `bid_count > 0`
-- 3.6: Implement `best_ask() -> Option<&Level>` — returns `asks[0]` if `ask_count > 0`
-- 3.7: Implement `mid_price() -> Option<FixedPrice>` — `(best_bid.price + best_ask.price) / 2` using saturating arithmetic, returns None if either side empty
-- 3.8: Implement `spread() -> Option<FixedPrice>` — `best_ask.price - best_bid.price`, returns None if either side empty
+- [x] 3.1-3.8: OrderBook with [Level; 10] arrays, update_bid/ask, best_bid/ask, mid_price, spread
 
 ### Task 4: Implement is_tradeable (AC: validation logic with max_spread_threshold parameter)
-- 4.1: Implement `is_tradeable(&self, max_spread_threshold: FixedPrice) -> bool`
-- 4.2: Check `bid_count >= 3` and `ask_count >= 3`
-- 4.3: Check spread <= max_spread_threshold (using spread() method)
-- 4.4: Check top-level bid and ask sizes are non-zero (`bids[0].size > 0 && asks[0].size > 0`)
-- 4.5: Check bids are in descending price order (for all populated levels)
-- 4.6: Check asks are in ascending price order (for all populated levels)
+- [x] 4.1-4.6: is_tradeable with bid/ask count, spread, size, monotonicity checks
 
 ### Task 5: Implement MarketEvent and MarketEventType (AC: MarketEvent fields and derives)
-- 5.1: Create `crates/core/src/events/market.rs`
-- 5.2: Define `MarketEventType` enum with variants: `Trade`, `BidUpdate`, `AskUpdate`, `BookSnapshot` (or as appropriate for CME data)
-- 5.3: Define `MarketEvent` struct with `timestamp: UnixNanos`, `symbol_id: u32`, `event_type: MarketEventType`, `price: FixedPrice`, `size: u32`, `side: Option<Side>`
-- 5.4: Derive `Debug, Clone, Copy` on both types
+- [x] 5.1-5.4: MarketEvent, MarketEventType with Trade/BidUpdate/AskUpdate/BookSnapshot
 
 ### Task 6: Write property tests (AC: proptest for OrderBook invariants)
-- 6.1: Create `crates/core/tests/order_book_properties.rs`
-- 6.2: Property test: `is_tradeable()` returns false when `bid_count < 3` or `ask_count < 3`
-- 6.3: Property test: `is_tradeable()` returns false for non-monotonic bid/ask prices
-- 6.4: Property test: `best_bid()` always returns the highest bid price (index 0 when properly sorted)
-- 6.5: Property test: `spread()` is always non-negative for valid books (asks > bids)
+- [x] 6.1-6.5: Property tests for tradeable conditions, monotonicity, spread non-negative
 
 ### Task 7: Write unit tests for OrderBook methods
-- 7.1: Test `empty()` returns book with zero counts
-- 7.2: Test `update_bid` / `update_ask` correctly set levels and counts
-- 7.3: Test `mid_price()` calculation for known values
-- 7.4: Test `is_tradeable()` with valid and invalid books
-- 7.5: Test edge case: index out of bounds on update (should not panic)
+- [x] 7.1-7.5: Unit tests for empty, update, mid_price, is_tradeable, out-of-bounds
 
 ## Dev Notes
 
@@ -103,6 +78,24 @@ crates/core/tests/
 ## Dev Agent Record
 
 ### Agent Model Used
+Claude Opus 4.6 (1M context)
+
 ### Debug Log References
+Fixed clippy module_inception warning by renaming order_book.rs to book.rs
+
 ### Completion Notes List
+- OrderBook: stack-allocated [Level; 10] with is_tradeable() gatekeeper
+- MarketEvent/MarketEventType: Copy types for hot-path market data
+- 9 unit tests + 5 property tests for OrderBook
+- Zero clippy warnings, all tests passing
+
+### Change Log
+- 2026-04-16: All tasks completed
+
 ### File List
+- crates/core/src/lib.rs (modified)
+- crates/core/src/order_book/mod.rs (new)
+- crates/core/src/order_book/book.rs (new)
+- crates/core/src/events/mod.rs (new)
+- crates/core/src/events/market.rs (new)
+- crates/core/tests/order_book_properties.rs (new)

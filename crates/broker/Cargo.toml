@@ -1,12 +1,17 @@
 [package]
-name = "futures_broker"
+name = "futures_bmad_broker"
 version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-futures_core = { workspace = true }
+futures_bmad_core = { workspace = true }
 rithmic-rs = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+secrecy = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

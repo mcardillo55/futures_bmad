@@ -1,4 +1,4 @@
-use futures_core::{BrokerAdapter, BrokerError, OrderParams, OrderState, Position};
+use futures_bmad_core::{BrokerAdapter, BrokerError, OrderParams, OrderState, Position};
 
 #[derive(Debug, Clone)]
 pub enum MockBehavior {
@@ -11,6 +11,7 @@ pub enum MockBehavior {
 pub struct MockBrokerAdapter {
     behavior: MockBehavior,
     submitted_orders: Vec<OrderParams>,
+    cancelled_orders: Vec<u64>,
     next_order_id: u64,
     subscriptions: Vec<String>,
     positions: Vec<Position>,
@@ -22,6 +23,7 @@ impl MockBrokerAdapter {
         Self {
             behavior,
             submitted_orders: Vec::new(),
+            cancelled_orders: Vec::new(),
             next_order_id: 1,
             subscriptions: Vec::new(),
             positions: Vec::new(),
@@ -41,6 +43,18 @@ impl MockBrokerAdapter {
         self.submitted_orders.len()
     }
 
+    pub fn cancelled_orders(&self) -> &[u64] {
+        &self.cancelled_orders
+    }
+
+    /// Returns the partial fill quantity if behavior is `PartialFill`, else `None`.
+    pub fn partial_fill_qty(&self) -> Option<u32> {
+        match &self.behavior {
+            MockBehavior::PartialFill(qty) => Some(*qty),
+            _ => None,
+        }
+    }
+
     pub fn set_positions(&mut self, positions: Vec<Position>) {
         self.positions = positions;
     }
@@ -52,6 +66,14 @@ impl MockBrokerAdapter {
 
 #[async_trait::async_trait]
 impl BrokerAdapter for MockBrokerAdapter {
+    async fn connect(&mut self) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
     async fn subscribe(&mut self, symbol: &str) -> Result<(), BrokerError> {
         self.subscriptions.push(symbol.to_string());
         Ok(())
@@ -63,17 +85,25 @@ impl BrokerAdapter for MockBrokerAdapter {
         self.next_order_id += 1;
 
         match &self.behavior {
-            MockBehavior::Fill | MockBehavior::PartialFill(_) => Ok(id),
-            MockBehavior::Reject(reason) => {
-                Err(BrokerError::OrderRejected { order_id: id, reason: reason.clone() })
+            MockBehavior::Fill => Ok(id),
+            MockBehavior::PartialFill(_qty) => {
+                // Returns success like Fill, but the partial fill quantity is available
+                // via the behavior field for downstream fill simulation.
+                Ok(id)
             }
-            MockBehavior::Timeout => {
-                Err(BrokerError::Timeout { operation: "submit_order".into(), duration_ms: 30000 })
-            }
+            MockBehavior::Reject(reason) => Err(BrokerError::OrderRejected {
+                order_id: id,
+                reason: reason.clone(),
+            }),
+            MockBehavior::Timeout => Err(BrokerError::Timeout {
+                operation: "submit_order".into(),
+                duration_ms: 30000,
+            }),
         }
     }
 
-    async fn cancel_order(&mut self, _order_id: u64) -> Result<(), BrokerError> {
+    async fn cancel_order(&mut self, order_id: u64) -> Result<(), BrokerError> {
+        self.cancelled_orders.push(order_id);
         Ok(())
     }
 
@@ -89,7 +119,7 @@ impl BrokerAdapter for MockBrokerAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_core::{OrderType, Side};
+    use futures_bmad_core::{OrderType, Side};
 
     fn test_order() -> OrderParams {
         OrderParams {

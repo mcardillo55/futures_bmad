@@ -1,6 +1,6 @@
 # Story 1.5: Core Traits & Clock
 
-Status: ready-for-dev
+Status: review
 
 ## Story
 
@@ -102,6 +102,28 @@ crates/core/src/
 ## Dev Agent Record
 
 ### Agent Model Used
+Claude Opus 4.6 (1M context)
+
 ### Debug Log References
+N/A
+
 ### Completion Notes List
+- Clock trait (Send+Sync) with SystemClock implementation
+- Signal trait with incremental update, reset, snapshot
+- RegimeDetector trait with RegimeState enum (Default=Unknown)
+- BrokerAdapter async trait with BrokerError (5 variants)
+- Added async-trait workspace dependency for dyn-safe async traits
+- 5 new unit tests (clock, broker error display, regime default, send+sync)
+
+### Change Log
+- 2026-04-16: All tasks completed
+
 ### File List
+- Cargo.toml (modified - added async-trait)
+- crates/core/Cargo.toml (modified - added async-trait)
+- crates/core/src/lib.rs (modified)
+- crates/core/src/traits/mod.rs (new)
+- crates/core/src/traits/clock.rs (new)
+- crates/core/src/traits/signal.rs (new)
+- crates/core/src/traits/regime.rs (new)
+- crates/core/src/traits/broker.rs (new)

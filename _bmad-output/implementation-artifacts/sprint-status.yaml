@@ -48,7 +48,7 @@ development_status:
   1-2-core-price-and-time-types: review
   1-3-order-book-and-market-events: review
   1-4-order-and-position-types: review
-  1-5-core-traits-and-clock: ready-for-dev
+  1-5-core-traits-and-clock: review
   1-6-event-system-and-config-types: ready-for-dev
   1-7-test-kit: ready-for-dev
   epic-1-retrospective: optional

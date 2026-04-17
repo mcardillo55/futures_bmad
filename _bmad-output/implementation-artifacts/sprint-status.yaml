@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-16
-last_updated: 2026-04-17
+last_updated: 2026-04-17  # epic-3-retrospective completed
 project: futures_bmad
 project_key: NOKEY
 tracking_system: file-system
@@ -69,7 +69,7 @@ development_status:
   3-3-microprice-signal: done
   3-4-structural-price-levels: done
   3-5-composite-evaluation-and-fee-aware-gating: done
-  epic-3-retrospective: optional
+  epic-3-retrospective: done
 
   # Epic 4: Order Execution, Position Management & Event Journal
   epic-4: in-progress

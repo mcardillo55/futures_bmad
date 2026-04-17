@@ -1,6 +1,6 @@
 # Story 1.4: Order & Position Types
 
-Status: ready-for-dev
+Status: review
 
 ## Story
 
@@ -105,6 +105,27 @@ crates/core/tests/
 ## Dev Agent Record
 
 ### Agent Model Used
+Claude Opus 4.6 (1M context)
+
 ### Debug Log References
+N/A
+
 ### Completion Notes List
+- OrderState FSM with 11 states, can_transition_to/try_transition
+- OrderParams with Market/Limit/Stop validation
+- BracketOrder with type+side consistency validation
+- FillEvent in events module
+- Position with apply_fill (weighted avg), unrealized P&L in quarter-ticks
+- 15 new unit tests + 2 property tests
+
+### Change Log
+- 2026-04-16: All tasks completed
+
 ### File List
+- crates/core/src/lib.rs (modified)
+- crates/core/src/types/mod.rs (modified)
+- crates/core/src/types/order.rs (new)
+- crates/core/src/types/position.rs (new)
+- crates/core/src/events/mod.rs (modified)
+- crates/core/src/events/fill.rs (new)
+- crates/core/tests/order_state_properties.rs (new)

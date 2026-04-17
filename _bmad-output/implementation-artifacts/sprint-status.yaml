@@ -1,0 +1,124 @@
+# generated: 2026-04-16
+# last_updated: 2026-04-16
+# project: futures_bmad
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: {project-root}/_bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog → in-progress: Automatically when first story is created (via create-story)
+#   - in-progress → done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review (via Dev's code-review workflow)
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+
+generated: 2026-04-16
+last_updated: 2026-04-16
+project: futures_bmad
+project_key: NOKEY
+tracking_system: file-system
+story_location: "{project-root}/_bmad-output/implementation-artifacts"
+
+development_status:
+  # Epic 1: Project Foundation & Core Domain
+  epic-1: in-progress
+  1-1-cargo-workspace-and-ci-cd-setup: review
+  1-2-core-price-and-time-types: ready-for-dev
+  1-3-order-book-and-market-events: ready-for-dev
+  1-4-order-and-position-types: ready-for-dev
+  1-5-core-traits-and-clock: ready-for-dev
+  1-6-event-system-and-config-types: ready-for-dev
+  1-7-test-kit: ready-for-dev
+  epic-1-retrospective: optional
+
+  # Epic 2: Market Data Ingestion & Recording
+  epic-2: in-progress
+  2-1-rithmic-connection-and-market-data-subscription: ready-for-dev
+  2-2-order-book-reconstruction-from-live-feed: ready-for-dev
+  2-3-market-data-gap-detection: ready-for-dev
+  2-4-continuous-market-data-recording-to-parquet: ready-for-dev
+  2-5-historical-parquet-ingestion: ready-for-dev
+  epic-2-retrospective: optional
+
+  # Epic 3: Signal Analysis & Trade Decision Engine
+  epic-3: in-progress
+  3-1-obi-signal: ready-for-dev
+  3-2-vpin-signal: ready-for-dev
+  3-3-microprice-signal: ready-for-dev
+  3-4-structural-price-levels: ready-for-dev
+  3-5-composite-evaluation-and-fee-aware-gating: ready-for-dev
+  epic-3-retrospective: optional
+
+  # Epic 4: Order Execution, Position Management & Event Journal
+  epic-4: in-progress
+  4-1-sqlite-event-journal: ready-for-dev
+  4-2-market-order-submission: ready-for-dev
+  4-3-atomic-bracket-orders: ready-for-dev
+  4-4-order-state-machine-and-wal-persistence: ready-for-dev
+  4-5-position-tracking-and-broker-reconciliation: ready-for-dev
+  epic-4-retrospective: optional
+
+  # Epic 5: Risk Management & Circuit Breakers
+  epic-5: in-progress
+  5-1-circuit-breaker-framework: ready-for-dev
+  5-2-position-and-loss-limit-breakers: ready-for-dev
+  5-3-anomalous-position-detection-and-panic-mode: ready-for-dev
+  5-4-infrastructure-breakers: ready-for-dev
+  5-5-event-aware-trading-windows: ready-for-dev
+  5-6-operator-alerting-on-circuit-breaker-events: ready-for-dev
+  epic-5-retrospective: optional
+
+  # Epic 6: Regime Detection & Strategy Orchestration
+  epic-6: in-progress
+  6-1-threshold-based-regime-detector: ready-for-dev
+  6-2-strategy-enable-disable-and-regime-transition-logging: ready-for-dev
+  epic-6-retrospective: optional
+
+  # Epic 7: Historical Replay & Paper Trading
+  epic-7: in-progress
+  7-1-replay-orchestrator: ready-for-dev
+  7-2-deterministic-replay-verification: ready-for-dev
+  7-3-paper-trading-mode: ready-for-dev
+  7-4-paper-trade-result-recording: ready-for-dev
+  epic-7-retrospective: optional
+
+  # Epic 8: System Lifecycle & Reconnection
+  epic-8: in-progress
+  8-1-configuration-loading: ready-for-dev
+  8-2-startup-sequence: ready-for-dev
+  8-3-graceful-shutdown: ready-for-dev
+  8-4-reconnection-fsm: ready-for-dev
+  8-5-deployment-workflow: ready-for-dev
+  epic-8-retrospective: optional
+
+  # Epic 9: Observability & Monitoring
+  epic-9: in-progress
+  9-1-structured-logging-and-causality-tracing: ready-for-dev
+  9-2-diagnostic-event-logging: ready-for-dev
+  9-3-tax-reporting-data: ready-for-dev
+  9-4-prometheus-metrics-endpoint: ready-for-dev
+  9-5-watchdog-heartbeat-interface: ready-for-dev
+  9-6-credential-management: ready-for-dev
+  epic-9-retrospective: optional

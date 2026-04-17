@@ -1,0 +1,18 @@
+[trading]
+# symbol = "ES"
+# exchange = "CME"
+# max_position_size = 2
+
+[broker]
+# server = "rithmic-paper"
+# gateway = "chicago"
+
+[fees]
+# round_turn_fee = 4.18
+# exchange_fee = 1.28
+# nfa_fee = 0.02
+# clearing_fee = 0.10
+
+[logging]
+# level = "info"
+# format = "json"

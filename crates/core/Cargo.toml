@@ -1,0 +1,13 @@
+[package]
+name = "futures_core"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

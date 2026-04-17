@@ -1,0 +1,5 @@
+[trading]
+# mode = "paper"
+
+[broker]
+# server = "rithmic-paper"

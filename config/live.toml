@@ -1,0 +1,8 @@
+# Live trading configuration
+# WARNING: This config connects to live markets with real money.
+
+# [trading]
+# mode = "live"
+
+# [broker]
+# server = "rithmic-live"

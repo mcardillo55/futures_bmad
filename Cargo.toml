@@ -1,0 +1,69 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/futures-bmad/futures-trading"
+
+[workspace.dependencies]
+# Internal crates
+futures_core = { path = "crates/core" }
+futures_broker = { path = "crates/broker" }
+futures_engine = { path = "crates/engine" }
+futures_testkit = { path = "crates/testkit" }
+
+# Async runtime
+tokio = { version = "1.51.1", features = ["full"] }
+
+# Broker connectivity
+rithmic-rs = { version = "=0.7.2" }
+
+# Lock-free ring buffer
+rtrb = { version = "0.3.3" }
+
+# Database
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+
+# Logging / tracing
+tracing = { version = "0.1.44" }
+
+# Error handling
+thiserror = { version = "2.0.18" }
+anyhow = { version = "1.0.100" }
+
+# Testing
+proptest = { version = "1.9.0" }
+insta = { version = "1.46.3" }
+
+# Date/time
+chrono = { version = "0.4.44", features = ["serde"] }
+
+# Configuration
+config = { version = "0.15.22" }
+
+# Secrets
+secrecy = { version = "0.10.3" }
+
+# Performance
+tikv-jemallocator = { version = "0.6.1" }
+core_affinity = { version = "0.8.3" }
+
+# Channels
+crossbeam-channel = { version = "0.5.15" }
+
+# Protobuf
+prost = { version = "0.14.3" }
+
+# WebSocket
+tokio-tungstenite = { version = "0.29.0" }
+
+# Market data
+databento = { version = "=0.40.0" }
+
+# Arena allocator
+bumpalo = { version = "3.20.2" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,9 @@
+[package]
+name = "futures_testkit"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+futures_core = { workspace = true }
+proptest = { workspace = true }
+chrono = { workspace = true }

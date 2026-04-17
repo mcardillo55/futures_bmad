@@ -8,9 +8,13 @@ pub enum ConfigValidationError {
     EdgeMultipleTooLow(f64),
     NegativeDailyLoss,
     NegativeFee(String),
+    NonFiniteValue(String),
     FeeScheduleStale { days_old: i64 },
     FeeScheduleExpired { days_old: i64 },
+    FeeScheduleFuture,
+    InvalidDateFormat(String),
     EmptyField(String),
+    InvalidFormat { field: String, expected: String },
     ZeroTimeout(String),
     NegativeSpreadThreshold,
 }
@@ -23,29 +27,42 @@ impl std::fmt::Display for ConfigValidationError {
             Self::EdgeMultipleTooLow(v) => write!(f, "edge_multiple_threshold ({v}) must be >= 1.0"),
             Self::NegativeDailyLoss => write!(f, "max_daily_loss must be >= 0"),
             Self::NegativeFee(name) => write!(f, "{name} must be >= 0"),
+            Self::NonFiniteValue(name) => write!(f, "{name} must be a finite number"),
             Self::FeeScheduleStale { days_old } => {
                 write!(f, "fee schedule is {days_old} days old (>30 days, warning)")
             }
             Self::FeeScheduleExpired { days_old } => {
                 write!(f, "fee schedule is {days_old} days old (>60 days, blocked)")
             }
+            Self::FeeScheduleFuture => write!(f, "fee schedule effective_date is in the future"),
+            Self::InvalidDateFormat(val) => write!(f, "invalid date format: {val}"),
             Self::EmptyField(name) => write!(f, "{name} must not be empty"),
+            Self::InvalidFormat { field, expected } => {
+                write!(f, "{field} has invalid format (expected {expected})")
+            }
             Self::ZeroTimeout(name) => write!(f, "{name} must be > 0"),
             Self::NegativeSpreadThreshold => write!(f, "max_spread_threshold must be >= 0"),
         }
     }
 }
 
+impl std::error::Error for ConfigValidationError {}
+
 pub fn validate_trading_config(config: &TradingConfig) -> Result<(), Vec<ConfigValidationError>> {
     let mut errors = Vec::new();
 
+    if config.symbol.is_empty() {
+        errors.push(ConfigValidationError::EmptyField("symbol".into()));
+    }
     if config.max_position_size == 0 {
         errors.push(ConfigValidationError::ZeroPositionSize);
     }
     if config.max_consecutive_losses == 0 {
         errors.push(ConfigValidationError::ZeroConsecutiveLosses);
     }
-    if config.edge_multiple_threshold < 1.0 {
+    if !config.edge_multiple_threshold.is_finite() {
+        errors.push(ConfigValidationError::NonFiniteValue("edge_multiple_threshold".into()));
+    } else if config.edge_multiple_threshold < 1.0 {
         errors.push(ConfigValidationError::EdgeMultipleTooLow(config.edge_multiple_threshold));
     }
     if config.max_daily_loss.raw() < 0 {
@@ -55,32 +72,64 @@ pub fn validate_trading_config(config: &TradingConfig) -> Result<(), Vec<ConfigV
         errors.push(ConfigValidationError::NegativeSpreadThreshold);
     }
 
+    // Validate session time format (HH:MM)
+    let time_re = |s: &str| -> bool {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() != 2 { return false; }
+        let h = parts[0].parse::<u32>().ok();
+        let m = parts[1].parse::<u32>().ok();
+        matches!((h, m), (Some(h), Some(m)) if h < 24 && m < 60)
+    };
+    if config.session_start.is_empty() {
+        errors.push(ConfigValidationError::EmptyField("session_start".into()));
+    } else if !time_re(&config.session_start) {
+        errors.push(ConfigValidationError::InvalidFormat {
+            field: "session_start".into(),
+            expected: "HH:MM".into(),
+        });
+    }
+    if config.session_end.is_empty() {
+        errors.push(ConfigValidationError::EmptyField("session_end".into()));
+    } else if !time_re(&config.session_end) {
+        errors.push(ConfigValidationError::InvalidFormat {
+            field: "session_end".into(),
+            expected: "HH:MM".into(),
+        });
+    }
+
     if errors.is_empty() { Ok(()) } else { Err(errors) }
 }
 
 pub fn validate_fee_config(config: &FeeConfig) -> Result<(), Vec<ConfigValidationError>> {
     let mut errors = Vec::new();
 
-    if config.exchange_fee < 0.0 {
-        errors.push(ConfigValidationError::NegativeFee("exchange_fee".into()));
-    }
-    if config.clearing_fee < 0.0 {
-        errors.push(ConfigValidationError::NegativeFee("clearing_fee".into()));
-    }
-    if config.nfa_fee < 0.0 {
-        errors.push(ConfigValidationError::NegativeFee("nfa_fee".into()));
-    }
-    if config.broker_commission < 0.0 {
-        errors.push(ConfigValidationError::NegativeFee("broker_commission".into()));
+    for (name, value) in [
+        ("exchange_fee", config.exchange_fee),
+        ("clearing_fee", config.clearing_fee),
+        ("nfa_fee", config.nfa_fee),
+        ("broker_commission", config.broker_commission),
+    ] {
+        if !value.is_finite() {
+            errors.push(ConfigValidationError::NonFiniteValue(name.into()));
+        } else if value < 0.0 {
+            errors.push(ConfigValidationError::NegativeFee(name.into()));
+        }
     }
 
-    if let Ok(date) = NaiveDate::parse_from_str(&config.effective_date, "%Y-%m-%d") {
-        let today = chrono::Utc::now().date_naive();
-        let days_old = (today - date).num_days();
-        if days_old > 60 {
-            errors.push(ConfigValidationError::FeeScheduleExpired { days_old });
-        } else if days_old > 30 {
-            errors.push(ConfigValidationError::FeeScheduleStale { days_old });
+    match NaiveDate::parse_from_str(&config.effective_date, "%Y-%m-%d") {
+        Ok(date) => {
+            let today = chrono::Utc::now().date_naive();
+            let days_old = (today - date).num_days();
+            if days_old < 0 {
+                errors.push(ConfigValidationError::FeeScheduleFuture);
+            } else if days_old > 60 {
+                errors.push(ConfigValidationError::FeeScheduleExpired { days_old });
+            } else if days_old > 30 {
+                errors.push(ConfigValidationError::FeeScheduleStale { days_old });
+            }
+        }
+        Err(_) => {
+            errors.push(ConfigValidationError::InvalidDateFormat(config.effective_date.clone()));
         }
     }
 

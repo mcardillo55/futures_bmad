@@ -1,6 +1,18 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
+/// Error returned when a non-finite f64 (NaN, +Inf, -Inf) is passed to `from_f64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonFinitePrice;
+
+impl fmt::Display for NonFinitePrice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "price must be a finite number (not NaN or Infinity)")
+    }
+}
+
+impl std::error::Error for NonFinitePrice {}
+
 /// Fixed-point price representation using quarter-ticks.
 ///
 /// Stores prices as `price * 4` in integer form, avoiding all floating-point
@@ -22,7 +34,7 @@ impl Serialize for FixedPrice {
 impl<'de> Deserialize<'de> for FixedPrice {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = f64::deserialize(deserializer)?;
-        Ok(FixedPrice::from_f64(value))
+        FixedPrice::from_f64(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -50,11 +62,17 @@ impl FixedPrice {
     /// Convert from f64 price to FixedPrice using banker's rounding (round half to even).
     ///
     /// This should only be used at config load time or for display input parsing.
-    pub fn from_f64(price: f64) -> FixedPrice {
+    pub fn from_f64(price: f64) -> Result<FixedPrice, NonFinitePrice> {
+        if !price.is_finite() {
+            return Err(NonFinitePrice);
+        }
         // Banker's rounding: round half to even
         let scaled = price * 4.0;
+        if !scaled.is_finite() {
+            return Err(NonFinitePrice);
+        }
         let rounded = bankers_round(scaled);
-        FixedPrice(rounded)
+        Ok(FixedPrice(rounded))
     }
 
     /// Convert to f64 for display purposes only.
@@ -92,9 +110,9 @@ mod tests {
 
     #[test]
     fn known_price_conversions() {
-        assert_eq!(FixedPrice::from_f64(4482.25), FixedPrice(17929));
-        assert_eq!(FixedPrice::from_f64(0.0), FixedPrice(0));
-        assert_eq!(FixedPrice::from_f64(-100.50), FixedPrice(-402));
+        assert_eq!(FixedPrice::from_f64(4482.25).unwrap(), FixedPrice(17929));
+        assert_eq!(FixedPrice::from_f64(0.0).unwrap(), FixedPrice(0));
+        assert_eq!(FixedPrice::from_f64(-100.50).unwrap(), FixedPrice(-402));
     }
 
     #[test]
@@ -123,10 +141,17 @@ mod tests {
     #[test]
     fn bankers_rounding() {
         // 0.5 rounds to 0 (even)
-        assert_eq!(FixedPrice::from_f64(0.125), FixedPrice(0)); // 0.125 * 4 = 0.5 -> 0
+        assert_eq!(FixedPrice::from_f64(0.125).unwrap(), FixedPrice(0)); // 0.125 * 4 = 0.5 -> 0
         // 1.5 rounds to 2 (even)
-        assert_eq!(FixedPrice::from_f64(0.375), FixedPrice(2)); // 0.375 * 4 = 1.5 -> 2
+        assert_eq!(FixedPrice::from_f64(0.375).unwrap(), FixedPrice(2)); // 0.375 * 4 = 1.5 -> 2
         // 2.5 rounds to 2 (even)
-        assert_eq!(FixedPrice::from_f64(0.625), FixedPrice(2)); // 0.625 * 4 = 2.5 -> 2
+        assert_eq!(FixedPrice::from_f64(0.625).unwrap(), FixedPrice(2)); // 0.625 * 4 = 2.5 -> 2
+    }
+
+    #[test]
+    fn non_finite_rejected() {
+        assert_eq!(FixedPrice::from_f64(f64::NAN), Err(NonFinitePrice));
+        assert_eq!(FixedPrice::from_f64(f64::INFINITY), Err(NonFinitePrice));
+        assert_eq!(FixedPrice::from_f64(f64::NEG_INFINITY), Err(NonFinitePrice));
     }
 }

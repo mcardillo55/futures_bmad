@@ -1,4 +1,4 @@
-use futures_core::{FixedPrice, Level, OrderBook, UnixNanos};
+use futures_bmad_core::{FixedPrice, Level, OrderBook, UnixNanos};
 
 /// Fluent builder for OrderBook in tests. Uses f64 prices for ergonomics.
 pub struct OrderBookBuilder {
@@ -14,7 +14,7 @@ impl OrderBookBuilder {
 
     pub fn bid(mut self, price: f64, size: u32) -> Self {
         self.bids.push(Level {
-            price: FixedPrice::from_f64(price),
+            price: FixedPrice::from_f64(price).expect("test price must be finite"),
             size,
             order_count: 1,
         });
@@ -23,7 +23,7 @@ impl OrderBookBuilder {
 
     pub fn bid_with_count(mut self, price: f64, size: u32, count: u16) -> Self {
         self.bids.push(Level {
-            price: FixedPrice::from_f64(price),
+            price: FixedPrice::from_f64(price).expect("test price must be finite"),
             size,
             order_count: count,
         });
@@ -32,7 +32,7 @@ impl OrderBookBuilder {
 
     pub fn ask(mut self, price: f64, size: u32) -> Self {
         self.asks.push(Level {
-            price: FixedPrice::from_f64(price),
+            price: FixedPrice::from_f64(price).expect("test price must be finite"),
             size,
             order_count: 1,
         });
@@ -41,7 +41,7 @@ impl OrderBookBuilder {
 
     pub fn ask_with_count(mut self, price: f64, size: u32, count: u16) -> Self {
         self.asks.push(Level {
-            price: FixedPrice::from_f64(price),
+            price: FixedPrice::from_f64(price).expect("test price must be finite"),
             size,
             order_count: count,
         });
@@ -112,8 +112,8 @@ mod tests {
 
         assert_eq!(book.bid_count, 2);
         assert_eq!(book.ask_count, 2);
-        assert_eq!(book.best_bid().unwrap().price, FixedPrice::from_f64(4500.00));
-        assert_eq!(book.best_ask().unwrap().price, FixedPrice::from_f64(4500.25));
+        assert_eq!(book.best_bid().unwrap().price, FixedPrice::from_f64(4500.00).unwrap());
+        assert_eq!(book.best_ask().unwrap().price, FixedPrice::from_f64(4500.25).unwrap());
     }
 
     #[test]

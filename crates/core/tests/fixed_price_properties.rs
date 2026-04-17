@@ -1,4 +1,4 @@
-use futures_core::FixedPrice;
+use futures_bmad_core::FixedPrice;
 use proptest::prelude::*;
 
 proptest! {
@@ -39,7 +39,7 @@ proptest! {
     ) {
         // Generate prices that are exact quarter-tick multiples
         let price = ticks as f64 * 0.25;
-        let fp = FixedPrice::from_f64(price);
+        let fp = FixedPrice::from_f64(price).unwrap();
         let back = fp.to_f64();
         prop_assert!((back - price).abs() < 1e-10, "round-trip failed: {price} -> {back}");
     }

@@ -6,7 +6,7 @@ mod side;
 mod unix_nanos;
 
 pub use bar::Bar;
-pub use fixed_price::FixedPrice;
+pub use fixed_price::{FixedPrice, NonFinitePrice};
 pub use order::{
     BracketOrder, BracketOrderError, BracketState, OrderParams, OrderParamsError, OrderState,
     OrderStateError, OrderType,

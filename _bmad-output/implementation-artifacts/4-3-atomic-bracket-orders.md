@@ -140,3 +140,42 @@ crates/engine/src/
 
 ## Change Log
 - 2026-04-30: Story 4.3 implementation complete. Bracket lifecycle (entry → SL → TP → Full), flatten retry (3 attempts, 1s interval), panic mode (idempotent, persists, preserves stops). 17 new tests; total workspace tests 255. Branch: `feat/story-4-3-atomic-bracket-orders` off `feat/story-4-2-market-order-submission`.
+- 2026-04-30: Code review completed (`_bmad-output/implementation-artifacts/4-3-code-review-2026-04-30.md`). Verdict: APPROVE-WITH-CHANGES. 0 BLOCKING / 4 SHOULD-FIX / 5 NICE-TO-HAVE.
+
+## Senior Developer Review
+
+**Reviewer:** Senior Developer (adversarial — Blind Hunter / Edge Case Hunter / Acceptance Auditor)
+**Date:** 2026-04-30
+**Verdict:** APPROVE-WITH-CHANGES
+**Findings:** 0 BLOCKING / 4 SHOULD-FIX / 5 NICE-TO-HAVE
+**Validation:** `cargo test --workspace` → 255 passing; `cargo clippy --all-targets -- -D warnings` clean.
+**Full report:** `_bmad-output/implementation-artifacts/4-3-code-review-2026-04-30.md`.
+
+### AC Audit
+- AC1 (BracketOrder shape — entry market / TP limit / SL stop / OCO): **MET**
+- AC2 (BracketState transitions: EntryOnly → EntryAndStop → Full): **MET**
+- AC3 (Flatten retry 3×1s → panic mode; entries cancelled, stops preserved, manual restart): **MET**
+- AC4 (TP/SL fill → OCO counterpart auto-cancelled, position flat, P&L in quarter-ticks, journaled): **PARTIAL** — TP/SL detection, P&L, journal records all present and tested. OCO counterpart cancel is logged (debug) and verification deferred to 4-5 reconciliation, per spec Task 2.5. Position-flat wiring from `on_bracket_fill` → `Position::apply_fill` is also deferred to 4-5 per Task 5.5. Both deferrals are honest and explicit in the spec.
+
+### Verdict on Dev Deviations
+1. `OrderParams` (not `OrderEvent`) on `BracketOrder` — **JUSTIFIED**. Architecture doc actually shows `OrderParams`; routing fields belong at submit time. Translation seam (`build_order_event`) is single-purpose and used four times.
+2. `from_decision` constructor + legacy `new` retained — **JUSTIFIED** (minor doc-comment improvement: N-1).
+3. `FlattenOutcome::Success { order_id, attempts }` (not `Success(FillEvent)`) — **JUSTIFIED, strongly**. Submission ack and fill are distinct events; embedding a synthesized FillEvent would create two sources of truth.
+4. Native OCO (Rithmic CME) — **JUSTIFIED**, with N-2 carrying the unverified-on-the-wire concern forward to 4-5.
+5. `OrderCancellation` trait surface ready, engine-side iterator deferred to 4-4/4-5/epic-5 — **JUSTIFIED** and honest. Trait is testable via `MockCancellation`; the "never cancel a stop" contract is enforced by docstring (the trait can't enforce it itself).
+
+### Should-Fix
+- **S-1**: `on_entry_fill` does not handle `FillType::Rejected` on the entry leg → would submit a naked stop. Live impact gated by deferred event-loop wiring; fix before 4-5. (`crates/engine/src/order_manager/bracket.rs:253-275`)
+- **S-2**: `on_entry_fill` ignores `FillType::Partial` size → SL/TP oversized for partial entries. CME Market entries are typically atomic; document the assumption or implement cumulative-fill tracking. (`crates/engine/src/order_manager/bracket.rs:253-335`)
+- **S-3**: `engage_flatten` swallows `transition(Flattening)` errors with `let _ = …` → could engage flatten twice. (`crates/engine/src/order_manager/bracket.rs:585`)
+- **S-4**: `FlattenRetry` reuses the same `order_id` across retries — relies on broker-side dedup that is not verified in the diff. (`crates/broker/src/position_flatten.rs:127-194`)
+
+### Nice-to-Have
+- **N-1**: `BracketOrder::new` doc comment unclear about when to prefer `new` vs `from_decision`.
+- **N-2**: OCO native-vs-emulated assumption unverified — story 4-5 should carry a recorded-session test.
+- **N-3**: `OrderCancellation::cancel_entries_and_limits` returns `usize` instead of `Result<usize, _>`.
+- **N-4**: `FlattenRetry` does not enforce a position-exists precondition.
+- **N-5**: `on_stop_confirmed` does not distinguish "duplicate ack" from "out-of-order confirmation after Flattening".
+
+### Cross-Reference
+None of the 4-2 deferred items (S-1..S-5, N-1..N-6) are made worse by 4-3, except N-1 (`OrderSubmitter` dual-surface) which gains a second caller (`FlattenRetry`) — consolidation in 4-4 is now more valuable.

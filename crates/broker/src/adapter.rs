@@ -1,4 +1,4 @@
-use futures_bmad_core::{BrokerAdapter, BrokerError, OrderParams, OrderState, Position};
+use futures_bmad_core::{BrokerAdapter, BrokerError, BrokerPosition, OrderParams, OrderState};
 use rithmic_rs::{RithmicEnv, RithmicTickerPlantHandle};
 use tracing::info;
 
@@ -87,7 +87,11 @@ impl BrokerAdapter for RithmicAdapter {
         ))
     }
 
-    async fn query_positions(&self) -> Result<Vec<Position>, BrokerError> {
+    async fn query_positions(&self) -> Result<Vec<BrokerPosition>, BrokerError> {
+        // Story 4-5: TickerPlant does not carry position state — the live
+        // position query goes through OrderPlant / PnlPlant in a future
+        // story. Surface as a typed error so the engine's reconciliation
+        // layer reports the gap explicitly rather than treating it as "flat".
         Err(BrokerError::PositionQueryFailed(
             "position query not yet implemented in TickerPlant adapter".into(),
         ))

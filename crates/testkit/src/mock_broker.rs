@@ -1,4 +1,4 @@
-use futures_bmad_core::{BrokerAdapter, BrokerError, OrderParams, OrderState, Position};
+use futures_bmad_core::{BrokerAdapter, BrokerError, BrokerPosition, OrderParams, OrderState};
 
 #[derive(Debug, Clone)]
 pub enum MockBehavior {
@@ -14,7 +14,7 @@ pub struct MockBrokerAdapter {
     cancelled_orders: Vec<u64>,
     next_order_id: u64,
     subscriptions: Vec<String>,
-    positions: Vec<Position>,
+    positions: Vec<BrokerPosition>,
     open_orders: Vec<(u64, OrderState)>,
 }
 
@@ -55,7 +55,7 @@ impl MockBrokerAdapter {
         }
     }
 
-    pub fn set_positions(&mut self, positions: Vec<Position>) {
+    pub fn set_positions(&mut self, positions: Vec<BrokerPosition>) {
         self.positions = positions;
     }
 
@@ -107,7 +107,7 @@ impl BrokerAdapter for MockBrokerAdapter {
         Ok(())
     }
 
-    async fn query_positions(&self) -> Result<Vec<Position>, BrokerError> {
+    async fn query_positions(&self) -> Result<Vec<BrokerPosition>, BrokerError> {
         Ok(self.positions.clone())
     }
 

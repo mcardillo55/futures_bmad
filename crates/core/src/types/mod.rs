@@ -12,6 +12,6 @@ pub use order::{
     OrderEvent, OrderKind, OrderParams, OrderParamsError, OrderState, OrderStateError, OrderType,
     RejectReason,
 };
-pub use position::Position;
+pub use position::{BrokerPosition, Position};
 pub use side::Side;
 pub use unix_nanos::UnixNanos;

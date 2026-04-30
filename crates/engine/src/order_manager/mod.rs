@@ -29,6 +29,7 @@
 
 pub mod bracket;
 pub mod state_machine;
+pub mod tracker;
 pub mod wal;
 
 pub use bracket::{
@@ -36,6 +37,10 @@ pub use bracket::{
 };
 pub use state_machine::{
     CircuitBreakerCallback, InvalidTransition, OrderStateMachine, OrderTransition,
+};
+pub use tracker::{
+    BrokerSnapshot, LocalSnapshot, MismatchKind, PositionMismatch, PositionTracker,
+    ReconciliationResult, ReconciliationTrigger,
 };
 pub use wal::{OrderWal, PendingOrder, WalError};
 

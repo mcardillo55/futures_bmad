@@ -1,4 +1,4 @@
-use crate::types::{OrderParams, OrderState, Position};
+use crate::types::{BrokerPosition, OrderParams, OrderState};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerError {
@@ -28,7 +28,12 @@ pub trait BrokerAdapter: Send + Sync {
     async fn subscribe(&mut self, symbol: &str) -> Result<(), BrokerError>;
     async fn submit_order(&mut self, params: OrderParams) -> Result<u64, BrokerError>;
     async fn cancel_order(&mut self, order_id: u64) -> Result<(), BrokerError>;
-    async fn query_positions(&self) -> Result<Vec<Position>, BrokerError>;
+    /// Story 4-5: returns the broker's view of open positions for
+    /// reconciliation. Empty Vec means flat across all symbols. The engine's
+    /// `PositionTracker::reconcile` compares this view against locally derived
+    /// state and trips the circuit breaker on mismatch (NFR16: never silently
+    /// correct).
+    async fn query_positions(&self) -> Result<Vec<BrokerPosition>, BrokerError>;
     async fn query_open_orders(&self) -> Result<Vec<(u64, OrderState)>, BrokerError>;
 }
 

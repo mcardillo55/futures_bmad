@@ -18,7 +18,7 @@ pub use traits::{
     SystemClock,
 };
 pub use types::{
-    Bar, BracketOrder, BracketOrderError, BracketState, BracketStateError, FillType, FixedPrice,
-    NonFinitePrice, OrderKind, OrderParams, OrderParamsError, OrderState, OrderStateError,
-    OrderType, Position, RejectReason, Side, UnixNanos,
+    Bar, BracketOrder, BracketOrderError, BracketState, BracketStateError, BrokerPosition,
+    FillType, FixedPrice, NonFinitePrice, OrderKind, OrderParams, OrderParamsError, OrderState,
+    OrderStateError, OrderType, Position, RejectReason, Side, UnixNanos,
 };

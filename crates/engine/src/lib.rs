@@ -6,6 +6,7 @@ pub mod data_quality;
 pub mod event_loop;
 pub mod ingest;
 pub mod order_book;
+pub mod order_manager;
 pub mod persistence;
 pub mod replay;
 pub mod risk;

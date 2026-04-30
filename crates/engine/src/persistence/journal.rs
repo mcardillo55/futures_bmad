@@ -282,6 +282,13 @@ impl JournalReceiver {
     fn recv_timeout(&self, timeout: Duration) -> Result<EngineEvent, RecvTimeoutError> {
         self.inner.recv_timeout(timeout)
     }
+
+    /// Test-only helper: non-blocking receive returning `None` for both `Empty`
+    /// and `Disconnected`. Used by sibling crate tests (e.g. `order_manager`)
+    /// that need to inspect dispatched events without spinning up the worker.
+    pub fn try_recv_for_test(&self) -> Option<EngineEvent> {
+        self.inner.try_recv().ok()
+    }
 }
 
 // ---------------------------------------------------------------------------

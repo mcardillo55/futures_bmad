@@ -1,5 +1,4 @@
-use super::{FixedPrice, Side};
-use crate::events::FillEvent;
+use super::{FillEvent, FixedPrice, Side};
 
 /// Tracks the current position for a symbol.
 #[derive(Debug, Clone, Copy)]
@@ -92,7 +91,7 @@ impl Position {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::UnixNanos;
+    use crate::types::{FillType, UnixNanos};
 
     fn make_fill(side: Side, price_raw: i64, size: u32) -> FillEvent {
         FillEvent {
@@ -101,6 +100,8 @@ mod tests {
             fill_size: size,
             timestamp: UnixNanos::default(),
             side,
+            decision_id: 0,
+            fill_type: FillType::Full,
         }
     }
 

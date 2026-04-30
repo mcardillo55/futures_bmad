@@ -1,10 +1,4 @@
-use crate::types::{FixedPrice, Side, UnixNanos};
-
-#[derive(Debug, Clone, Copy)]
-pub struct FillEvent {
-    pub order_id: u64,
-    pub fill_price: FixedPrice,
-    pub fill_size: u32,
-    pub timestamp: UnixNanos,
-    pub side: Side,
-}
+// `FillEvent` is defined in `crate::types::order` alongside `OrderEvent`/`FillType`.
+// The `events` module re-exports it so existing imports under
+// `crate::events::FillEvent` continue to resolve.
+pub use crate::types::FillEvent;

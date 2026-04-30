@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 futures_bmad_core = { workspace = true }
 rithmic-rs = { workspace = true }
+rtrb = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

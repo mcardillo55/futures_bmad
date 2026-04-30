@@ -119,14 +119,14 @@ impl BrokerAdapter for MockBrokerAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_bmad_core::{OrderType, Side};
+    use futures_bmad_core::{OrderKind, Side};
 
     fn test_order() -> OrderParams {
         OrderParams {
             symbol_id: 1,
             side: Side::Buy,
             quantity: 1,
-            order_type: OrderType::Market,
+            order_type: OrderKind::Market,
             price: None,
         }
     }

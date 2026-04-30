@@ -1,4 +1,4 @@
-use super::{FixedPrice, Side};
+use super::{FixedPrice, Side, UnixNanos};
 
 // --- Order State Machine ---
 
@@ -71,10 +71,17 @@ impl OrderState {
     }
 }
 
-// --- Order Type & Params ---
+// --- Order Kind & Params ---
 
+/// Coarse order classification used by `OrderParams`/`BracketOrder` validation.
+///
+/// This is a simple unit-variant enum kept for the order params/bracket validation
+/// path — it intentionally does NOT embed prices, because `OrderParams` carries
+/// `price: Option<FixedPrice>` separately. For the SPSC routing event (`OrderEvent`)
+/// the richer [`OrderType`] enum below is used instead, where the price/trigger is
+/// carried inside the variant for `Copy` efficiency on the hot path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderType {
+pub enum OrderKind {
     Market,
     Limit,
     Stop,
@@ -95,7 +102,7 @@ pub struct OrderParams {
     pub symbol_id: u32,
     pub side: Side,
     pub quantity: u32,
-    pub order_type: OrderType,
+    pub order_type: OrderKind,
     pub price: Option<FixedPrice>,
 }
 
@@ -105,12 +112,12 @@ impl OrderParams {
             return Err(OrderParamsError::ZeroQuantity);
         }
         match self.order_type {
-            OrderType::Market => {
+            OrderKind::Market => {
                 if self.price.is_some() {
                     return Err(OrderParamsError::UnexpectedPrice);
                 }
             }
-            OrderType::Limit | OrderType::Stop => {
+            OrderKind::Limit | OrderKind::Stop => {
                 if self.price.is_none() {
                     return Err(OrderParamsError::MissingPrice);
                 }
@@ -162,13 +169,13 @@ impl BracketOrder {
         take_profit.validate()?;
         stop_loss.validate()?;
 
-        if entry.order_type != OrderType::Market {
+        if entry.order_type != OrderKind::Market {
             return Err(BracketOrderError::EntryNotMarket);
         }
-        if take_profit.order_type != OrderType::Limit {
+        if take_profit.order_type != OrderKind::Limit {
             return Err(BracketOrderError::TakeProfitNotLimit);
         }
-        if stop_loss.order_type != OrderType::Stop {
+        if stop_loss.order_type != OrderKind::Stop {
             return Err(BracketOrderError::StopLossNotStop);
         }
 
@@ -186,6 +193,108 @@ impl BracketOrder {
             stop_loss,
         })
     }
+}
+
+// --- Order Routing Event Types (Story 4.2) ---
+//
+// These types travel across the SPSC ring-buffer queues that connect the engine's
+// order_manager to the broker's order_routing loop. They MUST be `Copy` so they can
+// flow through `rtrb` without heap pointers and without `Drop` glue. `RejectReason`
+// is therefore an enum (not a `String`) so the entire `OrderEvent` / `FillEvent`
+// pipeline stays plain-old-data on the hot path.
+
+/// Order type as carried on the routing queue. Unlike [`OrderKind`] the price (or
+/// stop trigger) is embedded inside the variant so the slim [`OrderEvent`] does not
+/// need a separate `price: Option<FixedPrice>` field — keeps the struct `Copy`-able
+/// and pinned to a single source of truth for the limit/stop level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderType {
+    Market,
+    Limit { price: FixedPrice },
+    Stop { trigger: FixedPrice },
+}
+
+impl OrderType {
+    /// Coarse classification; useful for matching parity with the older [`OrderKind`].
+    pub fn kind(&self) -> OrderKind {
+        match self {
+            OrderType::Market => OrderKind::Market,
+            OrderType::Limit { .. } => OrderKind::Limit,
+            OrderType::Stop { .. } => OrderKind::Stop,
+        }
+    }
+
+    /// Returns the limit price or stop trigger, if any (Market returns `None`).
+    pub fn price(&self) -> Option<FixedPrice> {
+        match *self {
+            OrderType::Market => None,
+            OrderType::Limit { price } => Some(price),
+            OrderType::Stop { trigger } => Some(trigger),
+        }
+    }
+}
+
+/// Common rejection codes carried in [`FillType::Rejected`].
+///
+/// Encoded as an enum (not a `String`) so the entire `FillEvent` stays `Copy` and
+/// can flow through the SPSC queue without heap allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// Account margin exhausted at the exchange.
+    InsufficientMargin,
+    /// Symbol not recognized by the broker.
+    InvalidSymbol,
+    /// Generic exchange-side reject (rate limit, halted instrument, etc).
+    ExchangeReject,
+    /// Connection to the broker lost mid-submission or before ack.
+    ConnectionLost,
+    /// Catch-all for codes we have not yet mapped.
+    Unknown,
+}
+
+/// Outcome attached to a [`FillEvent`].
+///
+/// `Partial { remaining }` carries the un-filled quantity (post-fill remaining qty,
+/// not the cumulative fill size — the consumer subtracts to derive cumulative if
+/// needed). `Rejected { reason }` always uses [`RejectReason`] (no `String`) so the
+/// fill event remains `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillType {
+    Full,
+    Partial { remaining: u32 },
+    Rejected { reason: RejectReason },
+}
+
+/// Engine -> broker order submission event.
+///
+/// `Copy` and pointer-free so it can sit in an `rtrb` ring buffer without heap
+/// indirection. The `decision_id` flows from signal evaluation through to the
+/// downstream `FillEvent` for end-to-end causality tracing (NFR17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderEvent {
+    pub order_id: u64,
+    pub symbol_id: u32,
+    pub side: Side,
+    pub quantity: u32,
+    pub order_type: OrderType,
+    pub decision_id: u64,
+    pub timestamp: UnixNanos,
+}
+
+/// Broker -> engine fill / rejection event.
+///
+/// `Copy` for the same SPSC reasons as [`OrderEvent`]. `decision_id` is propagated
+/// from the originating `OrderEvent` so journal entries chain back to the signal
+/// that produced the trade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillEvent {
+    pub order_id: u64,
+    pub fill_price: FixedPrice,
+    pub fill_size: u32,
+    pub timestamp: UnixNanos,
+    pub side: Side,
+    pub decision_id: u64,
+    pub fill_type: FillType,
 }
 
 #[cfg(test)]
@@ -222,7 +331,7 @@ mod tests {
             symbol_id: 1,
             side: Side::Buy,
             quantity: 1,
-            order_type: OrderType::Market,
+            order_type: OrderKind::Market,
             price: None,
         };
         assert!(market.validate().is_ok());
@@ -234,14 +343,14 @@ mod tests {
         assert!(bad_market.validate().is_err());
 
         let limit = OrderParams {
-            order_type: OrderType::Limit,
+            order_type: OrderKind::Limit,
             price: Some(FixedPrice::new(100)),
             ..market
         };
         assert!(limit.validate().is_ok());
 
         let bad_limit = OrderParams {
-            order_type: OrderType::Limit,
+            order_type: OrderKind::Limit,
             price: None,
             ..market
         };
@@ -254,21 +363,21 @@ mod tests {
             symbol_id: 1,
             side: Side::Buy,
             quantity: 1,
-            order_type: OrderType::Market,
+            order_type: OrderKind::Market,
             price: None,
         };
         let tp = OrderParams {
             symbol_id: 1,
             side: Side::Sell,
             quantity: 1,
-            order_type: OrderType::Limit,
+            order_type: OrderKind::Limit,
             price: Some(FixedPrice::new(200)),
         };
         let sl = OrderParams {
             symbol_id: 1,
             side: Side::Sell,
             quantity: 1,
-            order_type: OrderType::Stop,
+            order_type: OrderKind::Stop,
             price: Some(FixedPrice::new(50)),
         };
 
@@ -276,7 +385,7 @@ mod tests {
 
         // Wrong entry type
         let bad_entry = OrderParams {
-            order_type: OrderType::Limit,
+            order_type: OrderKind::Limit,
             price: Some(FixedPrice::new(100)),
             ..entry
         };
@@ -294,5 +403,37 @@ mod tests {
             BracketOrder::new(entry, bad_tp, sl),
             Err(BracketOrderError::InconsistentSides)
         ));
+    }
+
+    // --- Story 4.2 routing-event tests ---
+
+    /// Task 6.1: OrderEvent and FillEvent are `Copy`.
+    #[test]
+    fn order_and_fill_events_are_copy() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<OrderEvent>();
+        assert_copy::<FillEvent>();
+        assert_copy::<OrderType>();
+        assert_copy::<FillType>();
+        assert_copy::<RejectReason>();
+    }
+
+    #[test]
+    fn order_type_kind_and_price_extraction() {
+        let market = OrderType::Market;
+        assert_eq!(market.kind(), OrderKind::Market);
+        assert_eq!(market.price(), None);
+
+        let limit = OrderType::Limit {
+            price: FixedPrice::new(17_929),
+        };
+        assert_eq!(limit.kind(), OrderKind::Limit);
+        assert_eq!(limit.price(), Some(FixedPrice::new(17_929)));
+
+        let stop = OrderType::Stop {
+            trigger: FixedPrice::new(17_900),
+        };
+        assert_eq!(stop.kind(), OrderKind::Stop);
+        assert_eq!(stop.price(), Some(FixedPrice::new(17_900)));
     }
 }

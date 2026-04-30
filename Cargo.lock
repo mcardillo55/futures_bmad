@@ -700,6 +700,7 @@ dependencies = [
  "async-trait",
  "futures_bmad_core",
  "rithmic-rs",
+ "rtrb",
  "secrecy",
  "thiserror",
  "tokio",

@@ -1,10 +1,4 @@
-use crate::types::{OrderParams, OrderState, UnixNanos};
-
-#[derive(Debug, Clone)]
-pub struct OrderEvent {
-    pub order_id: u64,
-    pub state: OrderState,
-    pub params: OrderParams,
-    pub timestamp: UnixNanos,
-    pub decision_id: Option<u64>,
-}
+// `OrderEvent` is defined in `crate::types::order` (the routing-queue payload —
+// `Copy`, slim, `decision_id` mandatory). The `events` module re-exports it so
+// existing imports under `crate::events::OrderEvent` continue to resolve.
+pub use crate::types::OrderEvent;

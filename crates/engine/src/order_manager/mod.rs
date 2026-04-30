@@ -1,5 +1,9 @@
 //! Order manager — engine-side tracking of submitted orders and fill processing.
 //!
+//! The `bracket` submodule (story 4.3) layers atomic bracket-order management on top
+//! of this fill consumer: it owns the per-position [`BracketState`] machine, drives
+//! TP/SL submission after entry fills, and decides when to engage flatten retry.
+//!
 //! Story 4.2 introduces the fill consumer half: a non-blocking poll of the
 //! `FillQueueConsumer` (the engine end of the broker -> engine SPSC queue) on each
 //! event-loop tick. Each [`FillEvent`] is matched against a tracked
@@ -14,6 +18,12 @@
 //!   * track outstanding orders + their `decision_id`
 //!   * apply fills / rejections, validating state transitions
 //!   * forward each transition to the journal
+
+pub mod bracket;
+
+pub use bracket::{
+    BracketManager, BracketSubmissionError, FlattenContext, FlattenOutcome as BracketFlattenOutcome,
+};
 
 use std::collections::HashMap;
 

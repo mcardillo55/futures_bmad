@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-16
-last_updated: 2026-04-30  # story 4-2 ready for review
+last_updated: 2026-04-30  # story 4-3 ready for review
 project: futures_bmad
 project_key: NOKEY
 tracking_system: file-system
@@ -75,7 +75,7 @@ development_status:
   epic-4: in-progress
   4-1-sqlite-event-journal: review
   4-2-market-order-submission: review
-  4-3-atomic-bracket-orders: ready-for-dev
+  4-3-atomic-bracket-orders: review
   4-4-order-state-machine-and-wal-persistence: ready-for-dev
   4-5-position-tracking-and-broker-reconciliation: ready-for-dev
   epic-4-retrospective: optional

@@ -129,13 +129,47 @@ impl OrderParams {
 
 // --- Bracket Order ---
 
+/// Lifecycle state of an [`BracketOrder`].
+///
+/// Tracked per active position. Transitions are linear during normal entry submission
+/// (`NoBracket -> EntryOnly -> EntryAndStop -> Full`) and any non-terminal state may
+/// jump directly to `Flattening` when the flatten retry path engages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BracketState {
+    /// No bracket has been registered yet for the underlying decision.
     NoBracket,
+    /// Entry has filled; SL submission in flight (position is unprotected — narrow window).
     EntryOnly,
+    /// Stop-loss is resting at exchange; TP submission in flight.
     EntryAndStop,
+    /// Both legs resting at exchange — fully protected.
     Full,
+    /// Flatten retry has engaged (entry filled but bracket submission failed).
     Flattening,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid bracket state transition: {from:?} -> {to:?}")]
+pub struct BracketStateError {
+    pub from: BracketState,
+    pub to: BracketState,
+}
+
+impl BracketState {
+    /// Validate the linear forward transition graph. The `Flattening` state is
+    /// reachable from any non-terminal state since the flatten retry path may
+    /// engage at any point between entry submission and full bracket protection.
+    pub fn can_transition_to(&self, next: BracketState) -> bool {
+        use BracketState::*;
+        // Any -> Flattening is always allowed (escape hatch for the flatten path).
+        if matches!(next, Flattening) {
+            return !matches!(self, Flattening);
+        }
+        matches!(
+            (self, next),
+            (NoBracket, EntryOnly) | (EntryOnly, EntryAndStop) | (EntryAndStop, Full)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -152,15 +186,37 @@ pub enum BracketOrderError {
     InvalidParams(#[from] OrderParamsError),
 }
 
+/// Logical bracket order tracked per position.
+///
+/// Carries the three-leg order shape (Market entry + Limit TP + Stop SL) plus the
+/// per-bracket lifecycle state. The struct is `Copy` because every field is `Copy`,
+/// but it is conceptually mutable: the [`BracketManager`] in
+/// `engine::order_manager::bracket` keeps a mutable reference and walks the state
+/// machine via [`BracketOrder::transition`].
+///
+/// Note (story 4.3 dev deviation): the spec calls for `entry: OrderEvent` etc., but
+/// the architecture doc and the existing pre-routing-event API both used
+/// [`OrderParams`]. Keeping `OrderParams` here means the `BracketOrder` describes
+/// *what to submit* without prematurely allocating routing-event fields
+/// (`order_id`, `timestamp`) — those are attached by the [`BracketManager`] when
+/// each leg is actually pushed onto the [`OrderQueueProducer`] in the engine.
 #[derive(Debug, Clone, Copy)]
 pub struct BracketOrder {
+    pub bracket_id: u64,
+    pub decision_id: u64,
     pub entry: OrderParams,
     pub take_profit: OrderParams,
     pub stop_loss: OrderParams,
+    pub state: BracketState,
 }
 
 impl BracketOrder {
+    /// Construct from already-validated [`OrderParams`]. Used by the legacy bracket
+    /// API (signal evaluators that build `OrderParams` directly) and by the more
+    /// ergonomic `from_decision` helper below.
     pub fn new(
+        bracket_id: u64,
+        decision_id: u64,
         entry: OrderParams,
         take_profit: OrderParams,
         stop_loss: OrderParams,
@@ -188,10 +244,69 @@ impl BracketOrder {
         }
 
         Ok(Self {
+            bracket_id,
+            decision_id,
             entry,
             take_profit,
             stop_loss,
+            state: BracketState::NoBracket,
         })
+    }
+
+    /// Convenience constructor from a trade decision.
+    ///
+    /// Builds the three legs (Market entry, Limit TP at `tp_price`, Stop SL at
+    /// `sl_price`) with the exit side computed as the opposite of `side`. Initial
+    /// state is `NoBracket` (per Task 1.3).
+    pub fn from_decision(
+        bracket_id: u64,
+        decision_id: u64,
+        symbol_id: u32,
+        side: Side,
+        quantity: u32,
+        tp_price: FixedPrice,
+        sl_price: FixedPrice,
+    ) -> Result<Self, BracketOrderError> {
+        let exit_side = match side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+        let entry = OrderParams {
+            symbol_id,
+            side,
+            quantity,
+            order_type: OrderKind::Market,
+            price: None,
+        };
+        let take_profit = OrderParams {
+            symbol_id,
+            side: exit_side,
+            quantity,
+            order_type: OrderKind::Limit,
+            price: Some(tp_price),
+        };
+        let stop_loss = OrderParams {
+            symbol_id,
+            side: exit_side,
+            quantity,
+            order_type: OrderKind::Stop,
+            price: Some(sl_price),
+        };
+        Self::new(bracket_id, decision_id, entry, take_profit, stop_loss)
+    }
+
+    /// Transition the bracket to the next state, validated against the bracket
+    /// state machine. Returns `Err` (with the offending arc) for illegal
+    /// transitions; the bracket is left untouched.
+    pub fn transition(&mut self, new_state: BracketState) -> Result<(), BracketStateError> {
+        if !self.state.can_transition_to(new_state) {
+            return Err(BracketStateError {
+                from: self.state,
+                to: new_state,
+            });
+        }
+        self.state = new_state;
+        Ok(())
     }
 }
 
@@ -381,7 +496,10 @@ mod tests {
             price: Some(FixedPrice::new(50)),
         };
 
-        assert!(BracketOrder::new(entry, tp, sl).is_ok());
+        let bracket = BracketOrder::new(1, 7, entry, tp, sl).unwrap();
+        assert_eq!(bracket.bracket_id, 1);
+        assert_eq!(bracket.decision_id, 7);
+        assert_eq!(bracket.state, BracketState::NoBracket);
 
         // Wrong entry type
         let bad_entry = OrderParams {
@@ -390,7 +508,7 @@ mod tests {
             ..entry
         };
         assert!(matches!(
-            BracketOrder::new(bad_entry, tp, sl),
+            BracketOrder::new(1, 7, bad_entry, tp, sl),
             Err(BracketOrderError::EntryNotMarket)
         ));
 
@@ -400,9 +518,105 @@ mod tests {
             ..tp
         };
         assert!(matches!(
-            BracketOrder::new(entry, bad_tp, sl),
+            BracketOrder::new(1, 7, entry, bad_tp, sl),
             Err(BracketOrderError::InconsistentSides)
         ));
+    }
+
+    /// Task 6.1: BracketOrder::from_decision constructs Market/Limit/Stop legs
+    /// with opposite-side exits and the supplied prices.
+    #[test]
+    fn bracket_order_from_decision_constructs_three_legs() {
+        let bracket = BracketOrder::from_decision(
+            42,
+            99,
+            1,
+            Side::Buy,
+            3,
+            FixedPrice::new(200),
+            FixedPrice::new(50),
+        )
+        .unwrap();
+
+        assert_eq!(bracket.bracket_id, 42);
+        assert_eq!(bracket.decision_id, 99);
+        assert_eq!(bracket.state, BracketState::NoBracket);
+
+        // Entry: Market, Buy, qty 3, no price.
+        assert_eq!(bracket.entry.order_type, OrderKind::Market);
+        assert_eq!(bracket.entry.side, Side::Buy);
+        assert_eq!(bracket.entry.quantity, 3);
+        assert_eq!(bracket.entry.price, None);
+
+        // TP: Limit, Sell (opposite), qty 3, price = tp_price.
+        assert_eq!(bracket.take_profit.order_type, OrderKind::Limit);
+        assert_eq!(bracket.take_profit.side, Side::Sell);
+        assert_eq!(bracket.take_profit.price, Some(FixedPrice::new(200)));
+
+        // SL: Stop, Sell (opposite), qty 3, price = sl_price.
+        assert_eq!(bracket.stop_loss.order_type, OrderKind::Stop);
+        assert_eq!(bracket.stop_loss.side, Side::Sell);
+        assert_eq!(bracket.stop_loss.price, Some(FixedPrice::new(50)));
+
+        // Sell-entry symmetry.
+        let short = BracketOrder::from_decision(
+            1,
+            1,
+            1,
+            Side::Sell,
+            1,
+            FixedPrice::new(50),
+            FixedPrice::new(200),
+        )
+        .unwrap();
+        assert_eq!(short.take_profit.side, Side::Buy);
+        assert_eq!(short.stop_loss.side, Side::Buy);
+    }
+
+    /// Task 6.2: BracketState transitions: valid ones succeed, invalid return
+    /// an error with the offending arc preserved.
+    #[test]
+    fn bracket_state_transitions() {
+        // Linear forward path
+        let mut b = BracketOrder::from_decision(
+            1,
+            1,
+            1,
+            Side::Buy,
+            1,
+            FixedPrice::new(200),
+            FixedPrice::new(50),
+        )
+        .unwrap();
+        assert_eq!(b.state, BracketState::NoBracket);
+        b.transition(BracketState::EntryOnly).unwrap();
+        b.transition(BracketState::EntryAndStop).unwrap();
+        b.transition(BracketState::Full).unwrap();
+        // Skipping ahead is invalid
+        let mut b2 = BracketOrder::from_decision(
+            2,
+            2,
+            1,
+            Side::Buy,
+            1,
+            FixedPrice::new(200),
+            FixedPrice::new(50),
+        )
+        .unwrap();
+        assert!(matches!(
+            b2.transition(BracketState::Full),
+            Err(BracketStateError {
+                from: BracketState::NoBracket,
+                to: BracketState::Full
+            })
+        ));
+        assert_eq!(b2.state, BracketState::NoBracket, "state untouched on err");
+
+        // Flattening reachable from any non-terminal state
+        b2.transition(BracketState::EntryOnly).unwrap();
+        b2.transition(BracketState::Flattening).unwrap();
+        // Flattening -> Flattening rejected (no idempotent self-loop)
+        assert!(b2.transition(BracketState::Flattening).is_err());
     }
 
     // --- Story 4.2 routing-event tests ---

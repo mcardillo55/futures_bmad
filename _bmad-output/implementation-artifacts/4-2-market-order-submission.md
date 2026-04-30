@@ -236,3 +236,82 @@ Claude Opus 4.7 (1M context)
   count 221 -> 238. `cargo build` / `cargo test --workspace` /
   `cargo clippy --all-targets -- -D warnings` / `cargo fmt --check` (touched
   files) all clean.
+- 2026-04-30: Senior Developer Review (see below) — APPROVE-WITH-CHANGES. 0
+  blocking, 5 should-fix, 6 nice-to-have. Full report:
+  `_bmad-output/implementation-artifacts/4-2-code-review-2026-04-30.md`.
+
+## Senior Developer Review
+
+- **Reviewer:** Senior Developer (adversarial — Blind Hunter / Edge Case Hunter / Acceptance Auditor)
+- **Date:** 2026-04-30
+- **Branch / commit:** `feat/story-4-2-market-order-submission` @ `7cc79da`
+- **Verdict:** **APPROVE-WITH-CHANGES**
+- **Validation:** `cargo test --workspace` 238/238 passing; `cargo clippy --all-targets -- -D warnings` clean.
+
+### Acceptance Criteria
+
+| AC | Status | Evidence |
+|---|---|---|
+| OrderEvent → SPSC queue → Rithmic OrderPlant; carries symbol/side/qty/market | **PARTIAL** | Routing loop wired (`crates/broker/src/order_routing.rs:298-352`); `RithmicSubmitter` is a documented placeholder returning `ConnectionLost` (`order_routing.rs:241-247`). |
+| Exchange confirm/reject → FillEvent on SPSC fill queue | **PARTIAL** | Translation seam wired (`order_routing.rs:466-537`); live `rithmic-rs` execution-report listener deferred to a later epic-4 story per the spec deviation. |
+| Engine FillEvent → state Confirmed→Filled/PartialFill, journaled with decision_id | **MET** | `OrderManager::apply_fill` (`crates/engine/src/order_manager/mod.rs:151-285`); journal record at `:255-262`. |
+| Reject → state Rejected, reason logged, journaled | **MET** | `apply_fill` Rejected branch (`order_manager/mod.rs:198-214`). |
+
+**2 MET / 2 PARTIAL / 0 NOT-MET.** Both PARTIALs are attributable to the deferred OrderPlant connectivity, which the dev correctly flagged.
+
+### Findings Summary
+
+| Severity | Count |
+|---|---:|
+| Blocking | 0 |
+| Should-fix | 5 |
+| Nice-to-have | 6 |
+
+### Should-Fix
+
+- **S-1** Over-fills (`fill.fill_size > tracked.remaining_quantity`) and over-`remaining` partials are silently accepted — corrupts position arithmetic. Add a sanity check in `apply_fill` before bookkeeping. (`crates/engine/src/order_manager/mod.rs:243-251`)
+- **S-2** Zero-size non-rejected fills are accepted as terminal `Filled`, leaving a phantom filled order with no position change. Guard `fill_size == 0 && !FillType::Rejected{..}`. (`crates/engine/src/order_manager/mod.rs:182-251`)
+- **S-3** `PartialFill -> Rejected` is not in the state machine, so a partial-then-reject sequence (a real broker scenario) strands the order in `PartialFill` indefinitely. Add the arc (or `PartialFill -> Cancelled`). (`crates/core/src/types/order.rs:28-50`; `order_manager/mod.rs:222-239`)
+- **S-4** Synthetic reject-fill is pushed via `try_push` whose return is ignored — on full FillQueue the rejection is dropped and the order strands silently. (`crates/broker/src/order_routing.rs:347`)
+- **S-5** `SubmissionError::Timeout` maps to `RejectReason::Unknown` and emits a Rejected fill. Timeouts mean "don't know" — should leave order in `Submitted` (or use `Uncertain`) and let reconciliation resolve. (`crates/broker/src/order_routing.rs:269-280`)
+
+### Nice-to-Have
+
+- **N-1** Two parallel "submit an order" trait surfaces (`BrokerAdapter::submit_order` and `OrderSubmitter::submit_order`) — recommend consolidation in story 4.4.
+- **N-2** `route_pending_orders` drains in a tight `while let Some(...)` loop with no `tokio::task::yield_now()` — risks starving Tokio peers under burst.
+- **N-3** `DecisionIdMap` is unbounded for non-terminal partials; long-running sessions slow-leak entries until story-4.5 reconciliation lands.
+- **N-4** Auto-upgrade `Submitted -> Confirmed` on first non-rejection fill skips the journal record for that arc — forensic replay sees Confirmed appear with no Submitted→Confirmed entry.
+- **N-5** Orphan fills journal `decision_id = Some(0)` rather than `None`, ambiguous with a legitimate `decision_id = 0`.
+- **N-6** `publish_execution_report` doesn't validate `side` against the originating order — a wire-protocol bug could flip side and corrupt position.
+
+### Verdict on the Three Flagged Deviations
+
+1. **`OrderSubmitter` instead of `BrokerAdapter::submit_order`** — **JUSTIFIED** for this story (blast radius is real), but the resulting duplication is real (see N-1). Address in 4.4.
+2. **`RithmicSubmitter` placeholder** — **JUSTIFIED.** The trait seam is clean; swap-in is localized. The reject-fill path is end-to-end exercised against the stub.
+3. **Live fill listener deferred; only translation seam shipped** — **JUSTIFIED.** `publish_execution_report` is the right seam, tests drive it directly, the contract for `decision_id` propagation is locked in.
+
+### Triage
+
+| Bucket | Count |
+|---|---:|
+| `decision_needed` | 0 |
+| `patch` | 5 (S-1 .. S-5) |
+| `defer` | 6 (N-1 .. N-6) |
+| `dismiss` | 0 |
+
+Full report: `_bmad-output/implementation-artifacts/4-2-code-review-2026-04-30.md`.
+
+### Review Findings
+
+- [ ] [Review][Patch] S-1: Over-fill / `fill_size > remaining_quantity` silently accepted [crates/engine/src/order_manager/mod.rs:243-251]
+- [ ] [Review][Patch] S-2: Zero-size non-rejected fill accepted as terminal Filled [crates/engine/src/order_manager/mod.rs:182-251]
+- [ ] [Review][Patch] S-3: Partial-then-Rejected strands order in PartialFill — state machine missing arc [crates/core/src/types/order.rs:28-50]
+- [ ] [Review][Patch] S-4: Synthetic reject-fill push result ignored — drops on full FillQueue [crates/broker/src/order_routing.rs:347]
+- [ ] [Review][Patch] S-5: `SubmissionError::Timeout` should not synthesize a Rejected fill [crates/broker/src/order_routing.rs:269-280]
+- [x] [Review][Defer] N-1: Two parallel "submit an order" trait surfaces — consolidate in 4.4 [crates/broker/src/order_routing.rs:200-206] — deferred, blast-radius across testkit/RithmicAdapter
+- [x] [Review][Defer] N-2: `route_pending_orders` lacks `tokio::task::yield_now()` for burst load [crates/broker/src/order_routing.rs:306-350] — deferred, no observed starvation today
+- [x] [Review][Defer] N-3: `DecisionIdMap` unbounded for non-terminal partials [crates/broker/src/order_routing.rs:370-405] — deferred, owned by 4.5 reconciliation
+- [x] [Review][Defer] N-4: Auto-upgrade `Submitted -> Confirmed` skips journal record [crates/engine/src/order_manager/mod.rs:175-262] — deferred, audit-trail gap is documented
+- [x] [Review][Defer] N-5: Orphan fills journal `decision_id = Some(0)` rather than `None` [crates/engine/src/order_manager/mod.rs:258] — deferred, sentinel semantic
+- [x] [Review][Defer] N-6: `publish_execution_report` doesn't validate side against original order [crates/broker/src/order_routing.rs:466-537] — deferred, defensive check for live listener story
+

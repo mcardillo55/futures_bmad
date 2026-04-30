@@ -271,10 +271,38 @@ impl SubmissionError {
             SubmissionError::ConnectionLost => RejectReason::ConnectionLost,
             SubmissionError::InvalidSymbol => RejectReason::InvalidSymbol,
             SubmissionError::ExchangeReject => RejectReason::ExchangeReject,
-            // Timeouts and unknown failures — surface as Unknown so operators
+            // Unknown failures — surface as Unknown so operators
             // dig into the diagnostic logs rather than misclassifying as a
-            // hard exchange reject.
+            // hard exchange reject. (Timeout no longer flows through this
+            // mapping — see `should_synthesize_reject` carryover (4-2 S-5).)
             SubmissionError::Timeout | SubmissionError::Unknown => RejectReason::Unknown,
+        }
+    }
+
+    /// Whether this submission error should produce a synthetic `Rejected`
+    /// fill back into the engine's FillQueue.
+    ///
+    /// Carryover (4-2 S-5): `Timeout` MUST NOT synthesize a Rejected fill.
+    /// Story 4-4 introduced the `Submitted -> Uncertain -> PendingRecon`
+    /// reconciliation arc precisely so that ambiguous submissions can be
+    /// resolved via a broker query rather than guessed as a rejection. If we
+    /// synthesize Rejected here, the engine drops the WAL row on a terminal
+    /// state, but the order may have actually reached the exchange — the
+    /// "phantom position" failure mode the architecture's NFR16 forbids.
+    /// Leaving the order in `Submitted` lets the engine's 5s timeout
+    /// watchdog flip it to `Uncertain` and 4-5 reconciliation resolves the
+    /// true broker state.
+    pub fn should_synthesize_reject(self) -> bool {
+        match self {
+            // Hard transport / exchange rejects — no order ever reached an
+            // exchange match.
+            SubmissionError::ConnectionLost
+            | SubmissionError::InvalidSymbol
+            | SubmissionError::ExchangeReject
+            | SubmissionError::Unknown => true,
+            // Ambiguous — let the engine's Uncertain-state machine handle it
+            // via the 5s timeout + broker reconciliation path.
+            SubmissionError::Timeout => false,
         }
     }
 }
@@ -323,28 +351,53 @@ pub async fn route_pending_orders<S: OrderSubmitter + ?Sized>(
                 decisions.insert(event.order_id, event.decision_id);
             }
             Err(err) => {
-                warn!(
-                    target: "order_routing",
-                    order_id = event.order_id,
-                    decision_id = event.decision_id,
-                    error = %err,
-                    "order submission failed — synthesizing reject fill"
-                );
-                let reject = FillEvent {
-                    order_id: event.order_id,
-                    // Reject fills carry a zero fill price (no execution occurred);
-                    // the engine should treat fill_size==0 with FillType::Rejected
-                    // as the canonical rejection signal.
-                    fill_price: futures_bmad_core::FixedPrice::default(),
-                    fill_size: 0,
-                    timestamp: now,
-                    side: event.side,
-                    decision_id: event.decision_id,
-                    fill_type: FillType::Rejected {
-                        reason: err.to_reject_reason(),
-                    },
-                };
-                fill_producer.try_push(reject);
+                if err.should_synthesize_reject() {
+                    warn!(
+                        target: "order_routing",
+                        order_id = event.order_id,
+                        decision_id = event.decision_id,
+                        error = %err,
+                        "order submission failed — synthesizing reject fill"
+                    );
+                    let reject = FillEvent {
+                        order_id: event.order_id,
+                        // Reject fills carry a zero fill price (no execution occurred);
+                        // the engine should treat fill_size==0 with FillType::Rejected
+                        // as the canonical rejection signal.
+                        fill_price: futures_bmad_core::FixedPrice::default(),
+                        fill_size: 0,
+                        timestamp: now,
+                        side: event.side,
+                        decision_id: event.decision_id,
+                        fill_type: FillType::Rejected {
+                            reason: err.to_reject_reason(),
+                        },
+                    };
+                    if !fill_producer.try_push(reject) {
+                        error!(
+                            target: "order_routing",
+                            order_id = event.order_id,
+                            decision_id = event.decision_id,
+                            "FillQueue full — synthetic reject dropped (engine state will be reconciled via broker query)"
+                        );
+                    }
+                } else {
+                    // Carryover (4-2 S-5): submission Timeout is ambiguous —
+                    // the order MAY have reached the exchange. Do NOT
+                    // synthesize a Rejected fill (which would terminally
+                    // resolve the order in the engine despite a real
+                    // possibility of a fill). Leave the engine's order in
+                    // `Submitted`; the 5s timeout watchdog will flip it to
+                    // `Uncertain` and 4-5 reconciliation will query the
+                    // broker for the true status.
+                    warn!(
+                        target: "order_routing",
+                        order_id = event.order_id,
+                        decision_id = event.decision_id,
+                        error = %err,
+                        "order submission ambiguous (timeout) — leaving Submitted for engine timeout/reconciliation"
+                    );
+                }
             }
         }
     }
@@ -702,6 +755,40 @@ mod tests {
         // Failed submissions do NOT populate the decision-id map (no exchange
         // record to subsequently match against).
         assert!(decisions.is_empty());
+    }
+
+    /// Carryover (4-2 S-5): SubmissionError::Timeout MUST NOT synthesize a
+    /// Rejected fill — the order may have reached the exchange. Leaving it
+    /// Submitted lets the engine's 5s timeout watchdog flip it to Uncertain
+    /// and 4-5 reconciliation resolve via broker query.
+    #[tokio::test]
+    async fn routing_loop_does_not_synthesize_reject_on_timeout() {
+        let (mut op, mut oc, mut fp, mut fc) = create_order_fill_queues();
+        let submitter = MockSubmitter::failing(0, SubmissionError::Timeout);
+        let mut decisions = DecisionIdMap::new();
+
+        let evt = sample_order(7, 11);
+        assert!(op.try_push(evt));
+        let now = UnixNanos::new(123);
+        route_pending_orders(&mut oc, &mut fp, &submitter, &mut decisions, now).await;
+
+        // No synthetic Rejected fill should appear — order stays Submitted.
+        assert!(
+            fc.try_pop().is_none(),
+            "Timeout submission must NOT generate a synthetic Rejected fill"
+        );
+        // Decision id is also NOT populated (no exchange round-trip).
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn submission_error_should_synthesize_reject_for_hard_failures_only() {
+        assert!(SubmissionError::ConnectionLost.should_synthesize_reject());
+        assert!(SubmissionError::InvalidSymbol.should_synthesize_reject());
+        assert!(SubmissionError::ExchangeReject.should_synthesize_reject());
+        assert!(SubmissionError::Unknown.should_synthesize_reject());
+        // Timeout is the carve-out per 4-2 S-5.
+        assert!(!SubmissionError::Timeout.should_synthesize_reject());
     }
 
     #[tokio::test]

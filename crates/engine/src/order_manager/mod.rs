@@ -46,7 +46,7 @@ use futures_bmad_core::{FillEvent, FillType, OrderEvent, OrderState, RejectReaso
 use tracing::{debug, error, info, warn};
 
 use crate::persistence::journal::{
-    EngineEvent as JournalEvent, JournalSender, OrderStateChangeRecord,
+    EngineEvent as JournalEvent, JournalSender, OrderStateChangeRecord, SystemEventRecord,
 };
 
 /// Default Submitted -> Uncertain timeout (architecture spec NFR / Order State
@@ -203,6 +203,13 @@ pub enum ResolveOutcome {
     /// 30s escalation reached — circuit breaker has been tripped via the
     /// per-order callback. Submissions remain paused until manual intervention.
     EscalatedToCircuitBreaker,
+    /// Broker reports `Filled` and no bracket protects the position, but the
+    /// order's original side cannot be determined (no WAL or row missing) so we
+    /// cannot safely synthesize a flatten direction. Caller MUST escalate to
+    /// the circuit breaker — silently dropping a flatten on a confirmed fill is
+    /// a position-safety violation (NFR16).
+    /// Carryover (4-4 S-4).
+    FilledFlattenSideUnknown { order_id: u64, symbol_id: u32 },
 }
 
 /// Engine-side order tracker + fill consumer + state-machine + WAL coordinator.
@@ -494,6 +501,8 @@ impl OrderManager {
         }
 
         // Auto-upgrade Submitted -> Confirmed on first non-rejection fill.
+        // Carryover (4-4 S-3 / 4-2 N-4): journal the implicit transition so the
+        // audit trail does not have Confirmed appearing without a predecessor.
         if matches!(tracked.state, OrderState::Submitted)
             && !matches!(fill.fill_type, FillType::Rejected { .. })
         {
@@ -502,6 +511,16 @@ impl OrderManager {
             if let Some(sm) = self.state_machines.get_mut(&fill.order_id) {
                 let _ = sm.transition(OrderTransition::Confirm, fill.timestamp);
             }
+            let upgrade_record = OrderStateChangeRecord {
+                timestamp: fill.timestamp,
+                order_id: fill.order_id,
+                decision_id: Some(fill.decision_id),
+                from_state: format!("{:?}", OrderState::Submitted),
+                to_state: format!("{:?}", OrderState::Confirmed),
+            };
+            let _ = self
+                .journal
+                .send(JournalEvent::OrderStateChange(upgrade_record));
         }
 
         let from_state = tracked.state;
@@ -615,6 +634,12 @@ impl OrderManager {
         }
 
         // WAL bookkeeping for terminal outcomes.
+        // Carryover (4-4 S-1): if mark_resolved fails the in-memory state still
+        // advances but the WAL row stays at the previous non-terminal state.
+        // Promote the failure from warn-only to a journaled SystemEvent so a
+        // forensic operator can see the durability lapse without grepping logs.
+        // (Recovery still works — `recover_pending` will re-find the row and
+        // the broker query reconciles — but the gap is now explicit.)
         if to_state.is_terminal()
             && let Some(wal) = self.wal.as_ref()
             && let Err(err) = wal.mark_resolved(fill.order_id, to_state)
@@ -625,6 +650,17 @@ impl OrderManager {
                 error = %err,
                 "wal mark_resolved failed for terminal fill"
             );
+            let durability_record = SystemEventRecord {
+                timestamp: fill.timestamp,
+                category: "order_wal".to_string(),
+                message: format!(
+                    "wal mark_resolved failed for order {} (final={:?}): {} — recovery will reconcile via broker query",
+                    fill.order_id, to_state, err
+                ),
+            };
+            let _ = self
+                .journal
+                .send(JournalEvent::SystemEvent(durability_record));
         }
 
         // Terminal? Drop tracking; non-terminal partials stay live.
@@ -783,13 +819,45 @@ impl OrderManager {
                     // Flatten the position side opposite to the original
                     // order's side. The TrackedOrder doesn't carry side
                     // directly; the WAL row does.
-                    let Some(flatten_side) = self.flatten_side_for(order_id) else {
-                        return ResolveOutcome::NotApplicable;
-                    };
-                    ResolveOutcome::FilledFlattenRequired {
-                        symbol_id: t.symbol_id,
-                        side: flatten_side,
-                        quantity: t.original_quantity,
+                    // Carryover (4-4 S-4): if we cannot determine the side
+                    // (no WAL or row missing), we MUST NOT silently drop the
+                    // flatten — escalate to the circuit breaker. Silently
+                    // collapsing into NotApplicable was a position-safety
+                    // violation per NFR16.
+                    if let Some(flatten_side) = self.flatten_side_for(order_id) {
+                        ResolveOutcome::FilledFlattenRequired {
+                            symbol_id: t.symbol_id,
+                            side: flatten_side,
+                            quantity: t.original_quantity,
+                        }
+                    } else {
+                        error!(
+                            target: "order_manager",
+                            order_id,
+                            decision_id = t.decision_id,
+                            symbol_id = t.symbol_id,
+                            "flatten side cannot be determined (no WAL or row missing) — escalating to circuit breaker"
+                        );
+                        if let Some(cb) = self.circuit_breaker.as_ref() {
+                            let invalid = InvalidTransition {
+                                from: OrderState::PendingRecon,
+                                trigger: OrderTransition::Resolve,
+                            };
+                            cb(&invalid);
+                        }
+                        let escalation = SystemEventRecord {
+                            timestamp: now,
+                            category: "order_manager".to_string(),
+                            message: format!(
+                                "flatten side unknown for order {} (symbol={}) on resolved Filled — escalated to circuit breaker",
+                                order_id, t.symbol_id
+                            ),
+                        };
+                        let _ = self.journal.send(JournalEvent::SystemEvent(escalation));
+                        ResolveOutcome::FilledFlattenSideUnknown {
+                            order_id,
+                            symbol_id: t.symbol_id,
+                        }
                     }
                 } else {
                     ResolveOutcome::NotApplicable

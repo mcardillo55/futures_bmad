@@ -17,6 +17,7 @@ parquet = { workspace = true }
 arrow = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 futures_bmad_testkit = { workspace = true }

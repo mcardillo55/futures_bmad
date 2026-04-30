@@ -162,3 +162,38 @@ crates/engine/src/
 
 ### Change Log
 - 2026-04-30: Story 4-5 implemented. Carryover commit `366fcf7` resolves 4-4 S-1/S-3/S-4 and 4-2 S-5/S-4. Feature commit (this) introduces `PositionTracker` + reconciliation engine. Sprint status updated to `review`.
+
+## Senior Developer Review (2026-04-30)
+
+**Reviewer:** Senior Developer (adversarial — Blind Hunter / Edge Case Hunter / Acceptance Auditor)
+**Verdict:** APPROVE-WITH-CHANGES
+
+**Findings:** 0 BLOCKING / 4 SHOULD-FIX / 6 NICE-TO-HAVE
+
+**Validation:** `cargo test --workspace` 313 passing. `cargo clippy --all-targets -- -D warnings` clean. Test delta 280 → 313 (+33) matches the spec target.
+
+**AC summary:** 1 MET / 3 PARTIAL / 0 NOT-MET. The three partials (AC2 reconciliation triggers, AC3 trading-halt submission gate, AC4 per-symbol consistent-path log) all resolve in story 8-2 (lifecycle wire-up). The tracker and reconciliation engine themselves are sound; the partials are honestly deferred wire-up gaps, not implementation defects.
+
+**Carryover verdicts:**
+- 4-4 S-1 (`mark_resolved` warn-only) — VERIFIED. Now journals a `SystemEvent` on terminal-resolution failure (`mod.rs:648-669`).
+- 4-4 S-2 (partial-entry SL/TP oversizing) — DEFERRAL CONTESTED → tracked as SHOULD-FIX S-3. Dev's "lives in BracketManager, not PositionTracker" defense is technically correct on file boundary but evades the spec wording (4-5 was the live-trading gate). Naked-short-on-SL-fire scenario remains real. ~30 LoC panic-mode escalation should land before 8-2 enables live trading.
+- 4-4 S-3 (Submitted→Confirmed audit gap) — VERIFIED. Implicit transition now journaled with decision_id (`mod.rs:511-529`).
+- 4-4 S-4 (silent flatten-side None) — VERIFIED. New `ResolveOutcome::FilledFlattenSideUnknown` escalates to circuit breaker + journal (`mod.rs:838-866`). NFR16 compliance restored.
+- 4-3 S-4 (FlattenRetry order_id reuse) — DEFERRAL ACCEPTED. Live OrderPlant integration story owns the recorded-session test.
+- 4-2 S-4 (`try_push` ignored) — VERIFIED. Return value checked, error logged (`order_routing.rs:376-383`).
+- 4-2 S-5 (Timeout → Rejected) — VERIFIED. `should_synthesize_reject()` carve-out in place; routing loop honors it; watchdog → Uncertain → reconciliation chain compiles end-to-end.
+
+**Deviation verdicts:**
+- D1 (reconciliation triggers deferred): ACCEPTED with caveat. API surface is adequate for startup but lacks a quiesce/sequence seam needed by periodic reconciliation under live trading (see S-1).
+- D2 (RithmicAdapter::query_positions stub): ACCEPTED. TickerPlant doesn't carry positions; this is structurally OrderPlant-gated.
+- D3 (BracketManager → PositionTracker wiring deferred): ACCEPTED with N-6 caveat (document which side is canonical for realized P&L on close).
+
+**SHOULD-FIX (must land before 8-2 wires this onto a live broker):**
+- S-1: In-flight-fill race during periodic reconciliation produces false-positive mismatches. Architectural — needs a sequence-number / quiesce hook on the tracker API.
+- S-2: `trading_halted` is set on mismatch but `OrderManager::submit_order` never consults it. AC3's "trading halted" effect is structurally unwired today.
+- S-3: Partial-entry SL/TP oversizing remains a position-safety hole (NFR16). Engineer the panic-mode escalation BEFORE live trading enable.
+- S-4: Reconciliation `avg_entry_price` strict-equality has no rounding tolerance — 1-q-tick drift across multiple additions will trip false mismatches.
+
+Full review: `_bmad-output/implementation-artifacts/4-5-code-review-2026-04-30.md`.
+
+**Epic 4 readiness:** APPROVED to retrospective. The five-story arc (4-1 journal, 4-2 market-order routing, 4-3 brackets, 4-4 state-machine + WAL, 4-5 position tracking + reconciliation) is structurally complete and individually well-tested. Two carryforward items (S-2 submission-gate wiring, S-3 partial-entry escalation) must be tracked as **epic-4 exit conditions before live trading**, not as 8-2 work, since both live entirely inside the engine and do not require OrderPlant connectivity.

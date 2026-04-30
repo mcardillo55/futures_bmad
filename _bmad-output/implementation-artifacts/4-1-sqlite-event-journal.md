@@ -114,18 +114,21 @@ Claude Opus 4.7 (1M context)
 ### Change Log
 - 2026-04-30: Implemented Story 4.1 — SQLite Event Journal (all tasks complete; 10 tests passing)
 - 2026-04-30: Code review complete — verdict REQUEST-CHANGES; 1 BLOCKING, 5 SHOULD-FIX, 7 NICE-TO-HAVE. See `4-1-code-review-2026-04-30.md`.
+- 2026-04-30: B-1 fix landed in `b065d30`; re-review verdict **RESOLVED** with no new findings. Story safe to proceed.
 
 ## Senior Developer Review
 
 **Date:** 2026-04-30
 **Reviewer:** Claude Opus 4.7 (1M context) via `bmad-code-review`
-**Verdict:** REQUEST-CHANGES
-**Full report:** [`4-1-code-review-2026-04-30.md`](./4-1-code-review-2026-04-30.md)
+**Verdict:** REQUEST-CHANGES → **B-1 RESOLVED in `b065d30` (2026-04-30 re-review)**
+**Full report:** [`4-1-code-review-2026-04-30.md`](./4-1-code-review-2026-04-30.md) (see § Re-review (2026-04-30) appendix for the post-fix verification)
+
+**Re-review addendum (2026-04-30, commit `b065d30`):** B-1 closed — the run loop now uses `recv_timeout` to distinguish `Timeout` (transient, flush partial, keep looping) from `Disconnected` (terminal, flush, exit). No path consumes-and-discards. New regression test `run_loop_survives_transient_empty_and_persists_all_events` exercises the multi-`Timeout`-with-live-senders scenario the prior code mishandled. All 11 journal tests pass. No new findings introduced. `cargo fmt --check` issues observed in unrelated files (`risk/fee_gate.rs`, `signals/{composite,levels,mod}.rs`, `tests/{levels,vpin,microprice,obi}_tests.rs`) are pre-existing on `main` and not introduced by this branch — defer to a separate `style:` cleanup PR. **Story 4-1 is safe to proceed to story 4-2.**
 
 ### Review Findings
 
 - [ ] [Review][Decision] Spec contradiction: AC2 vs Task 4.5 on missing decision_id (S-2) — AC2 says "every trade event includes decision_id" (hard); Task 4.5 says missing values are "logged and persisted" (soft). Implementation follows Task 4.5. Confirm intent and reword the AC, or change implementation to drop trade events without decision_id.
-- [ ] [Review][Patch][BLOCKING] `JournalReceiver::is_disconnected()` silently consumes events and exits prematurely (B-1) [`crates/engine/src/persistence/journal.rs:300-306, :382-440`] — `try_recv()` discards a message if one races in; `is_err()` collapses `Empty` and `Disconnected` so the worker exits whenever the queue is briefly empty. Restructure the run loop around a single `recv_timeout` returning `RecvTimeoutError::Disconnected` as the terminal signal.
+- [x] [Review][Patch][BLOCKING] `JournalReceiver::is_disconnected()` silently consumes events and exits prematurely (B-1) [`crates/engine/src/persistence/journal.rs:300-306, :382-440`] — `try_recv()` discards a message if one races in; `is_err()` collapses `Empty` and `Disconnected` so the worker exits whenever the queue is briefly empty. Restructure the run loop around a single `recv_timeout` returning `RecvTimeoutError::Disconnected` as the terminal signal. **RESOLVED in `b065d30`** — re-review confirmed the fix; see `4-1-code-review-2026-04-30.md` § Re-review (2026-04-30).
 - [ ] [Review][Patch] `decision_id = 0` sentinel collides with valid id 0 (S-1) [`journal.rs:501`] — make `trade_events.decision_id` nullable and persist `r.decision_id.map(|id| id as i64)`; let the existing error log surface the NFR17 violation.
 - [ ] [Review][Patch] `JournalError::Sqlite(InvalidQuery)` for WAL refusal is misleading (S-3) [`journal.rs:336-338`] — add `JournalError::WalUnavailable { actual: String }` variant.
 - [ ] [Review][Patch] No graceful-shutdown API on `EventJournal` / `JournalSender` (S-4) [`journal.rs:317-440`] — add an explicit Shutdown variant or a oneshot; acceptable to defer to story 8-3 if recorded in `deferred-work.md`.

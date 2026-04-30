@@ -113,3 +113,27 @@ Claude Opus 4.7 (1M context)
 
 ### Change Log
 - 2026-04-30: Implemented Story 4.1 — SQLite Event Journal (all tasks complete; 10 tests passing)
+- 2026-04-30: Code review complete — verdict REQUEST-CHANGES; 1 BLOCKING, 5 SHOULD-FIX, 7 NICE-TO-HAVE. See `4-1-code-review-2026-04-30.md`.
+
+## Senior Developer Review
+
+**Date:** 2026-04-30
+**Reviewer:** Claude Opus 4.7 (1M context) via `bmad-code-review`
+**Verdict:** REQUEST-CHANGES
+**Full report:** [`4-1-code-review-2026-04-30.md`](./4-1-code-review-2026-04-30.md)
+
+### Review Findings
+
+- [ ] [Review][Decision] Spec contradiction: AC2 vs Task 4.5 on missing decision_id (S-2) — AC2 says "every trade event includes decision_id" (hard); Task 4.5 says missing values are "logged and persisted" (soft). Implementation follows Task 4.5. Confirm intent and reword the AC, or change implementation to drop trade events without decision_id.
+- [ ] [Review][Patch][BLOCKING] `JournalReceiver::is_disconnected()` silently consumes events and exits prematurely (B-1) [`crates/engine/src/persistence/journal.rs:300-306, :382-440`] — `try_recv()` discards a message if one races in; `is_err()` collapses `Empty` and `Disconnected` so the worker exits whenever the queue is briefly empty. Restructure the run loop around a single `recv_timeout` returning `RecvTimeoutError::Disconnected` as the terminal signal.
+- [ ] [Review][Patch] `decision_id = 0` sentinel collides with valid id 0 (S-1) [`journal.rs:501`] — make `trade_events.decision_id` nullable and persist `r.decision_id.map(|id| id as i64)`; let the existing error log surface the NFR17 violation.
+- [ ] [Review][Patch] `JournalError::Sqlite(InvalidQuery)` for WAL refusal is misleading (S-3) [`journal.rs:336-338`] — add `JournalError::WalUnavailable { actual: String }` variant.
+- [ ] [Review][Patch] No graceful-shutdown API on `EventJournal` / `JournalSender` (S-4) [`journal.rs:317-440`] — add an explicit Shutdown variant or a oneshot; acceptable to defer to story 8-3 if recorded in `deferred-work.md`.
+- [ ] [Review][Patch] Single-writer-per-file constraint is undocumented (S-5) [`journal.rs:317`] — add a one-line doc constraint on `EventJournal`.
+- [ ] [Review][Patch] `u64 → i64` casts at multiple sites need a documenting comment (N-1) [`journal.rs:499-556`] — note that SQLite INTEGER stores i64; values > i64::MAX wrap.
+- [ ] [Review][Patch] `unchecked_transaction()` skips the nested-transaction safety check (N-2) [`journal.rs:349, 444, 473`] — prefer `conn.transaction()` or document the no-nested invariant in a struct comment.
+- [ ] [Review][Patch] `wal_checkpoint(PASSIVE)` busy=1 result is silently ignored (N-3) [`journal.rs:451-465`] — emit a `warn!` (or `debug!`) when `busy=1 && ckpt < log` to flag stuck checkpoints.
+- [ ] [Review][Patch] `flush_batch` errors mid-loop lose drained-but-not-yet-flushed events (N-4) [`journal.rs:436-440`] — document the trade-off as a comment so an operator-alerting story can wire a supervisor restart.
+- [ ] [Review][Patch] `DEFAULT_DB_PATH = "data/journal.db"` is `cwd`-relative (N-5) [`journal.rs:58`] — resolve via env var or document the cwd dependency.
+- [ ] [Review][Patch] `channel_backpressure_drops_when_full` 50 ms threshold may flake on CI (N-6) [`journal.rs:715-718`] — relax to 250 ms.
+- [ ] [Review][Patch] No real-capacity stress test exercises 8192 channel slots (N-7) [`journal.rs` test module] — push 9 000 events through `EventJournal::channel()` against a slow worker.

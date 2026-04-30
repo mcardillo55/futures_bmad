@@ -19,7 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use futures_bmad_core::{FixedPrice, Side, UnixNanos};
 use rusqlite::{Connection, params};
 use tracing::{debug, error, info, warn};
@@ -271,19 +271,16 @@ pub struct JournalReceiver {
 }
 
 impl JournalReceiver {
-    fn try_recv(&self) -> Option<EngineEvent> {
-        self.inner.try_recv().ok()
+    /// Non-blocking try_recv exposing the full crossbeam result so callers can
+    /// distinguish `Empty` (transient) from `Disconnected` (terminal).
+    fn try_recv(&self) -> Result<EngineEvent, TryRecvError> {
+        self.inner.try_recv()
     }
 
-    fn recv_timeout(&self, timeout: Duration) -> Option<EngineEvent> {
-        self.inner.recv_timeout(timeout).ok()
-    }
-
-    /// True once all senders are dropped and the channel is drained — terminal signal.
-    fn is_disconnected(&self) -> bool {
-        // crossbeam reports Disconnected on recv when senders are gone AND queue empty.
-        // We approximate by checking sender count via try_recv on next loop turn.
-        self.inner.is_empty() && self.inner.try_recv().is_err()
+    /// Bounded blocking recv. `Timeout` is a transient signal (flush partial batch);
+    /// `Disconnected` is the terminal signal (flush partial batch, then exit).
+    fn recv_timeout(&self, timeout: Duration) -> Result<EngineEvent, RecvTimeoutError> {
+        self.inner.recv_timeout(timeout)
     }
 }
 
@@ -359,42 +356,62 @@ impl EventJournal {
     /// `BATCH_INTERVAL`, whichever comes first, then flushes them in a single
     /// transaction. Periodically issues a passive WAL checkpoint.
     ///
+    /// Termination is driven solely by `RecvTimeoutError::Disconnected` — i.e., all
+    /// senders dropped AND the channel fully drained. A transient empty queue
+    /// (`Timeout`) only triggers a partial-batch flush; the loop never exits while
+    /// any sender is still alive.
+    ///
     /// This function blocks the calling thread; in async contexts spawn it via
     /// `tokio::task::spawn_blocking`.
     pub fn run(&mut self, receiver: JournalReceiver) -> Result<(), JournalError> {
         let mut batch: Vec<EngineEvent> = Vec::with_capacity(BATCH_SIZE);
         let mut last_flush = Instant::now();
         let mut last_checkpoint = Instant::now();
+        // Set on TryRecvError::Disconnected encountered during the inner drain — we
+        // finish flushing the current batch before exiting so no event is lost.
+        let mut disconnected = false;
 
         loop {
-            // Wait up to BATCH_INTERVAL for the next event.
+            // Block up to the remaining batch window for the next event. Using
+            // recv_timeout (rather than try_recv + sleep) is essential: every event
+            // received here is then either pushed onto the batch or is the terminal
+            // Disconnected signal — there is NO path that consumes-and-discards.
             let wait = BATCH_INTERVAL.saturating_sub(last_flush.elapsed());
-            let next = if wait.is_zero() {
-                receiver.try_recv()
-            } else {
-                receiver.recv_timeout(wait)
-            };
-            let received_any = next.is_some();
-
-            if let Some(event) = next {
-                batch.push(event);
-                // Drain any other immediately-available events to fill the batch.
-                while batch.len() < BATCH_SIZE {
-                    if let Some(more) = receiver.try_recv() {
-                        batch.push(more);
-                    } else {
-                        break;
+            match receiver.recv_timeout(wait) {
+                Ok(event) => {
+                    batch.push(event);
+                    // Drain any other immediately-available events into the batch.
+                    while batch.len() < BATCH_SIZE {
+                        match receiver.try_recv() {
+                            Ok(more) => batch.push(more),
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                // All senders gone — flush the batch we just built,
+                                // then exit cleanly via the outer break.
+                                disconnected = true;
+                                break;
+                            }
+                        }
                     }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // Transient empty queue — fall through to flush whatever we have
+                    // (which may be nothing). Do NOT exit; senders may still be alive.
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    // All senders dropped AND channel drained — terminal signal.
+                    disconnected = true;
                 }
             }
 
             let interval_elapsed = last_flush.elapsed() >= BATCH_INTERVAL;
             let batch_full = batch.len() >= BATCH_SIZE;
-            if !batch.is_empty() && (batch_full || interval_elapsed) {
+            if !batch.is_empty() && (batch_full || interval_elapsed || disconnected) {
                 self.flush_batch(&mut batch)?;
                 last_flush = Instant::now();
             } else if batch.is_empty() && interval_elapsed {
-                // Reset the timer so we don't spin on the elapsed branch.
+                // Reset the batch-window timer so the next loop iteration's
+                // recv_timeout uses the full window, not a saturated zero wait.
                 last_flush = Instant::now();
             }
 
@@ -406,14 +423,14 @@ impl EventJournal {
                 last_checkpoint = Instant::now();
             }
 
-            // Termination: senders all gone and queue drained.
-            if !received_any && batch.is_empty() && receiver.is_disconnected() {
+            if disconnected {
                 debug!(target: "journal", "all senders disconnected, journal worker exiting");
                 break;
             }
         }
 
-        // Flush anything left over.
+        // Defensive: flush anything still buffered (the disconnected branch above
+        // already flushes when batch is non-empty, but cover the edge case).
         if !batch.is_empty() {
             self.flush_batch(&mut batch)?;
         }
@@ -842,5 +859,52 @@ mod tests {
     fn journal_sender_is_send_and_clone() {
         fn assert_send_clone<T: Send + Clone>() {}
         assert_send_clone::<JournalSender>();
+    }
+
+    /// Regression for review finding B-1: the run loop must NOT exit on a transient
+    /// empty queue, and must NOT consume-and-discard events. Producer sends events
+    /// with deliberate gaps spanning multiple BATCH_INTERVAL windows; the journal
+    /// must persist every single one.
+    #[test]
+    fn run_loop_survives_transient_empty_and_persists_all_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+        let mut journal = EventJournal::new(&path).unwrap();
+        let (sender, receiver) = EventJournal::channel();
+
+        const N: u64 = 8;
+        // Sleep substantially longer than BATCH_INTERVAL (100 ms) between sends to
+        // guarantee the worker observes RecvTimeoutError::Timeout — and previously
+        // also is_empty() == true with try_recv() == Err(Empty), which the buggy
+        // is_disconnected() helper conflated with the terminal signal.
+        let gap = BATCH_INTERVAL * 3; // 300 ms
+
+        let producer = thread::spawn(move || {
+            for i in 0..N {
+                sender.send(EngineEvent::SystemEvent(SystemEventRecord {
+                    timestamp: UnixNanos::new(3_000 + i),
+                    category: "gap".into(),
+                    message: format!("g{i}"),
+                }));
+                thread::sleep(gap);
+            }
+            // Sender dropped here — recv_timeout will return Disconnected once drained.
+        });
+
+        journal.run(receiver).expect("worker run");
+        producer.join().unwrap();
+
+        let count: i64 = journal
+            .conn
+            .query_row(
+                "SELECT count(*) FROM system_events WHERE category = 'gap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, N as i64,
+            "every event must be persisted even when the channel briefly empties"
+        );
     }
 }

@@ -39,6 +39,11 @@ impl OrderState {
                 | (Confirmed, Uncertain)
                 | (PartialFill, PartialFill)
                 | (PartialFill, Filled)
+                // Carryover (4-2 S-3): broker can fill 1-of-N then reject the
+                // remainder; without this arc the order would strand in
+                // PartialFill indefinitely. The terminal state is Rejected so
+                // operators see "the rest got rejected" in the audit trail.
+                | (PartialFill, Rejected)
                 | (PartialFill, PendingCancel)
                 | (PartialFill, Uncertain)
                 | (PendingCancel, Cancelled)
@@ -429,6 +434,14 @@ mod tests {
         assert!(!OrderState::Idle.can_transition_to(OrderState::Filled));
         assert!(!OrderState::Filled.can_transition_to(OrderState::Idle));
         assert!(!OrderState::Rejected.can_transition_to(OrderState::Submitted));
+    }
+
+    /// Carryover (4-2 S-3): PartialFill -> Rejected is a real-world arc
+    /// (broker accepts entry, fills 1-of-N, then rejects remainder). Without
+    /// this arc the order strands in PartialFill indefinitely.
+    #[test]
+    fn partial_fill_to_rejected_is_valid() {
+        assert!(OrderState::PartialFill.can_transition_to(OrderState::Rejected));
     }
 
     #[test]

@@ -149,3 +149,53 @@ Claude Opus 4.7 (1M context) via bmad-dev-story skill (manual fallback path).
 
 ### Change Log
 - 2026-04-30: Initial implementation by dev agent. Branched from `feat/story-4-3-atomic-bracket-orders`. Carryover review findings 4-2 S-1, S-2, S-3 and 4-3 S-1, S-2, S-3 addressed inline.
+- 2026-04-30: Code review completed (`_bmad-output/implementation-artifacts/4-4-code-review-2026-04-30.md`). Verdict: APPROVE-WITH-CHANGES. 0 BLOCKING / 4 SHOULD-FIX / 6 NICE-TO-HAVE.
+
+## Senior Developer Review
+
+**Reviewer:** Senior Developer (adversarial — Blind Hunter / Edge Case Hunter / Acceptance Auditor)
+**Date:** 2026-04-30
+**Verdict:** APPROVE-WITH-CHANGES
+**Findings:** 0 BLOCKING / 4 SHOULD-FIX / 6 NICE-TO-HAVE
+**Validation:** `cargo test --workspace` → 280 passing (matches spec target +25); `cargo clippy --all-targets -- -D warnings` clean.
+**Full report:** `_bmad-output/implementation-artifacts/4-4-code-review-2026-04-30.md`.
+
+### AC Audit
+- AC1 (state_machine: only valid transitions, no wildcards, invalid trips circuit breaker): **MET**
+- AC2 (WAL write before submission, recover on crash): **MET**
+- AC3 (Submitted >5s → Uncertain, submissions paused, broker queried): **MET**
+- AC4 (Uncertain order with bracket → reconcile → bracket protects): **MET**
+- AC5 (Uncertain order without bracket → flatten triggered): **MET**
+
+**5 met / 0 partial / 0 not-met.**
+
+### Carryover Verification
+- 4-2 S-1 (over-fill via InvalidFillSize): **VERIFIED**
+- 4-2 S-2 (zero-size non-rejection fills rejected): **VERIFIED**
+- 4-2 S-3 (PartialFill→Rejected arc + tests, both core and engine SM): **VERIFIED**
+- 4-3 S-1 (rejected entry drops bracket, no naked stop): **VERIFIED**
+- 4-3 S-2 (warn-only on partial entry): **VERIFIED-AS-DEFERRED** — paper-only until 4.5; SL still over-sizes for partial entries; live trading must wait.
+- 4-3 S-3 (engage_flatten returns AlreadyFlattening on duplicate): **VERIFIED**
+
+### Verdict on Dev Deviations
+1. `BrokerOrderStatus` enum + `resolve_uncertain` (instead of `BrokerAdapter::query_order_status`): **JUSTIFIED**. Plug-in for 4-5 is straightforward.
+2. `apply_fill` retains Submitted→Confirmed auto-upgrade: **JUSTIFIED but with audit-trail gap** — no journal record for the implicit transition. Filed as SHOULD-FIX S-3.
+3. 4-3 S-2 partial-entry warn-only: **JUSTIFIED for paper-trading**; production live-trading gate is story 4.5.
+
+### Should-Fix
+- **S-1**: Terminal `mark_resolved` failure is warn-only; in-memory advances but WAL stale. Either propagate as fatal or journal a SystemEvent. (`crates/engine/src/order_manager/mod.rs:618-628`)
+- **S-2**: Partial entry over-sizes SL/TP (carryover 4-3 S-2). Until 4.5 lands, treat any partial entry as a panic-mode trigger OR explicitly gate live trading on 4.5 in the deployment spec. (`crates/engine/src/order_manager/bracket.rs:325-334`)
+- **S-3**: Submitted→Confirmed auto-upgrade is not journaled (forensic-replay sees Confirmed appear out of nowhere). Add a one-line journal record. (`crates/engine/src/order_manager/mod.rs:497-505`)
+- **S-4**: `flatten_side_for` silently returns None when WAL is absent OR row missing, collapsing `FilledFlattenRequired` into `NotApplicable`. Surface a distinct error variant or escalate to circuit breaker. (`crates/engine/src/order_manager/mod.rs:821-833`)
+
+### Nice-to-Have
+- **N-1**: `wal.rs:168` `let _ = order.order_type;` workaround — drop the awkward dummy.
+- **N-2**: `WalError::BadRow` lacks `order_id` context.
+- **N-3**: Fill arriving while order is in PendingRecon trips circuit breaker via `InvalidTransition` — should absorb silently and let `resolve_uncertain` be authoritative.
+- **N-4**: Document that `tick(now)` requires monotonic `now` from caller (good determinism, just docs).
+- **N-5**: `state_to_str`/`parse_state` open-coded — risks drift from `core::OrderState`. Consider centralizing on `OrderState`.
+- **N-6**: `OrderManager::with_wal` uses spread-from-`new` pattern; future field additions risk silent drop. Consider a builder.
+
+### Cross-Reference
+- 4-2 S-4, 4-2 S-5, 4-3 S-4 verified unchanged (correctly out-of-scope).
+- 4-2 N-1 (`OrderSubmitter` / `BrokerAdapter::submit_order` consolidation) NOT addressed in 4-4 — recommend it lands in 4-5 alongside the live `query_order_status` wiring.

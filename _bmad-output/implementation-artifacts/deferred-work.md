@@ -29,3 +29,18 @@
 - N-5: `BracketManager::on_stop_confirmed` does not distinguish "duplicate ack" from "out-of-order confirmation after Flattening" — both branches warn-log identically. [`crates/engine/src/order_manager/bracket.rs:344-361`]
 
 Note: S-1 (Rejected entry handling in `on_entry_fill`) and S-3 (engage_flatten error swallowing) from the 4-3 review are NOT deferred — they should land in 4-4 before the engine event loop wires the bracket manager onto a live fill stream. They are tracked in the 4-3 review report under Should-Fix.
+
+## Deferred from: code review of story-4.4 (2026-04-30)
+
+- S-1: Terminal `mark_resolved` failure leaves WAL row stale (warn-only); in-memory state advances but WAL row stays at previous non-terminal state. Recovery would still re-find the order and reconcile via broker query, but the durability gap is implicit. Either propagate as fatal engine error (per architecture's "circuit-breaker on WAL fail" posture) or emit a `SystemEvent` journal record so operators see the lapse. Owned by 4-5 wiring or a follow-up hardening pass. [`crates/engine/src/order_manager/mod.rs:618-628`]
+- S-3: Auto-upgrade `Submitted -> Confirmed` on first non-rejection fill skips the journal record for that arc (same defect as 4-2 N-4). All other transitions in `OrderManager` are journaled — this is the only audit-trail gap. ~5 lines to fix. [`crates/engine/src/order_manager/mod.rs:497-505`]
+- S-4: `flatten_side_for` silently returns None when WAL is absent or row missing, collapsing `FilledFlattenRequired` into `NotApplicable` and dropping the flatten request despite broker confirming filled. Add a distinct error variant or escalate to circuit breaker so the operator sees the safety lapse. [`crates/engine/src/order_manager/mod.rs:821-833`]
+- N-1: `wal.rs` has an awkward `let _ = order.order_type;` workaround and a `_silence_unused_order_type` fn to suppress unused-field warnings — both can be removed cleanly. [`crates/engine/src/order_manager/wal.rs:168, 348-351`]
+- N-2: `WalError::BadRow` does not include the offending `order_id` — add it for forensic diagnosis. [`crates/engine/src/order_manager/wal.rs:251, 284`]
+- N-3: A real `FillEvent` arriving for an order in `Uncertain`/`PendingRecon` trips the circuit-breaker callback via `InvalidTransition` (race with reconciliation). Position safety is preserved (`resolve_uncertain` is authoritative) but the breaker shouldn't fire for a benign data race. Absorb the fill silently, log at info, and let recon resolve. [`crates/engine/src/order_manager/mod.rs:550-566`]
+- N-4: `OrderManager::tick(now)` requires monotonic `now` from caller — document the contract in the module-level docs.
+- N-5: `wal::state_to_str`/`parse_state` are open-coded match arms over `core::OrderState`; risk drifting if a new variant is added. Centralize on `OrderState` (e.g., `OrderState::as_str() -> &'static str` + `from_str`). [`crates/engine/src/order_manager/wal.rs:315-346`]
+- N-6: `OrderManager::with_wal` uses `..Self::new(journal)` spread; future field additions risk silent drop. Consider a builder pattern as the field set grows. [`crates/engine/src/order_manager/mod.rs:245-250`]
+- AUDIT-1 (carryover): Over-fill / zero-size / partial-arithmetic-inconsistent fills are rejected with `FillOutcome::InvalidFillSize` and a `warn!` log, but NOT journaled as a `SystemEvent`. Forensic replay sees no record of the malformed fill. Promote the warn-log to a journal record.
+
+Note: S-2 from this review (partial entry over-sizes SL/TP via warn-only) is the same item already tracked as 4-3 S-2 above and remains owned by story 4-5 (position reconciliation). Live trading must NOT proceed until 4.5 lands or the engine adds a panic-mode trigger for any partial entry.

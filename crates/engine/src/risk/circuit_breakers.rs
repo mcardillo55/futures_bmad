@@ -530,6 +530,215 @@ impl CircuitBreakers {
     pub fn set_buffer_occupancy(&mut self, pct: f32) {
         self.buffer_occupancy_pct = pct;
     }
+
+    // ---------------------------------------------------------------
+    // Story 5.2 — position & loss-limit breakers / gate
+    // ---------------------------------------------------------------
+    //
+    // Four pieces of state, four entry points. All four are integer-only
+    // (quarter-ticks for P&L, raw counts for everything else) and on the
+    // hot path so they avoid heap allocation outside of the (cold)
+    // breaker-trip path.
+
+    /// Re-evaluate the max-position-size **gate** against the current net
+    /// position. Called every time the position changes (after a fill) or
+    /// any time the engine wants the gate to re-check.
+    ///
+    /// Behaviour:
+    ///   * `abs(current_position) >= max_position_size_limit` ⇒ trip the
+    ///     gate (no-op if already tripped).
+    ///   * `abs(current_position) <  max_position_size_limit` ⇒ if the gate
+    ///     was previously tripped, auto-clear it. The clearance flows
+    ///     through `clear_gate()` so the journal records a `Cleared` event
+    ///     and the duration of the outage is logged.
+    ///
+    /// Returns the emitted [`CircuitBreakerEvent`] when the call caused a
+    /// state transition, `None` otherwise (no transition ⇒ no journal
+    /// record). The on-the-wire side of `requested_position_size` is also
+    /// updated so the [`DenialReason::MaxPositionSizeExceeded`] context
+    /// reflects the size we last observed, even when the call is a no-op
+    /// against an already-tripped gate.
+    pub fn check_position_size(
+        &mut self,
+        current_position: i32,
+        timestamp: UnixNanos,
+    ) -> Option<CircuitBreakerEvent> {
+        let abs_pos = current_position.unsigned_abs();
+        // Always update the contextual field so denial messages stay
+        // current even when this call doesn't transition state.
+        self.requested_position_size = abs_pos;
+
+        let limit = self.max_position_size_limit;
+        let already_tripped = matches!(self.max_position_size_state, BreakerState::Tripped);
+
+        if abs_pos >= limit {
+            if already_tripped {
+                return None;
+            }
+            let evt = self.trip_breaker(
+                BreakerType::MaxPositionSize,
+                format!("position {abs_pos} >= max {limit}"),
+                timestamp,
+            );
+            return Some(evt);
+        }
+
+        if already_tripped {
+            // Gate condition resolved — auto-clear via `clear_gate` so the
+            // duration log line and the `Cleared` event flow through the
+            // canonical path.
+            return self
+                .clear_gate(BreakerType::MaxPositionSize, timestamp)
+                .ok();
+        }
+        None
+    }
+
+    /// Update the cumulative session P&L tracked by the daily-loss
+    /// **breaker**. Both arguments are quarter-tick integers.
+    ///
+    /// `daily_loss_current = realized_pnl + unrealized_pnl`. The breaker
+    /// trips when the current loss is at or beyond the configured cap:
+    /// since `max_daily_loss_ticks` is stored as a positive integer
+    /// representing the absolute size of the loss budget, the trip
+    /// condition is `daily_loss_current <= -max_daily_loss_ticks`.
+    ///
+    /// Once tripped, the breaker NEVER auto-clears — even if the P&L
+    /// recovers later in the same session. This is the manual-reset rule:
+    /// breakers persist until process restart. Subsequent calls update
+    /// the cached `daily_loss_current` (so denial messages stay current)
+    /// but do not move the breaker state.
+    ///
+    /// Returns the emitted trip event when this call caused the trip,
+    /// `None` otherwise.
+    pub fn update_daily_loss(
+        &mut self,
+        realized_pnl: i64,
+        unrealized_pnl: i64,
+        timestamp: UnixNanos,
+    ) -> Option<CircuitBreakerEvent> {
+        let total = realized_pnl.saturating_add(unrealized_pnl);
+        self.daily_loss_current = total;
+
+        // Already tripped? Update context only — never auto-clear.
+        if matches!(self.daily_loss_state, BreakerState::Tripped) {
+            return None;
+        }
+
+        // `max_daily_loss_ticks` is stored as a positive integer (the
+        // absolute size of the cap). The cap is reached when the cumulative
+        // P&L falls to or below `-limit`.
+        let trip = total <= -self.daily_loss_limit;
+        if trip {
+            let evt = self.trip_breaker(
+                BreakerType::DailyLoss,
+                format!(
+                    "daily P&L {total} ticks reached loss cap of {} ticks",
+                    self.daily_loss_limit
+                ),
+                timestamp,
+            );
+            return Some(evt);
+        }
+        None
+    }
+
+    /// Record a completed trade's win/loss outcome and update the
+    /// consecutive-losses **breaker**.
+    ///
+    /// Reset rule (architecture spec, Implementation Specifications table):
+    ///   * On a winning trade the counter resets to 0 — REGARDLESS of the
+    ///     breaker's current state. If the operator manually reset the
+    ///     breaker mid-session, the next loss will continue from 0 because
+    ///     the previous winning trade already cleared the counter.
+    ///   * On a losing trade the counter increments. When it reaches the
+    ///     configured limit the breaker trips.
+    ///
+    /// The deliberate consequence (per architecture.md): a manual breaker
+    /// reset does NOT zero the counter. If an operator restarts and the
+    /// next trade is also a loss, the counter continues from where the
+    /// last winner left it — preventing a "reset and immediately blow
+    /// through the limit again" scenario.
+    pub fn record_trade_result(
+        &mut self,
+        is_winner: bool,
+        timestamp: UnixNanos,
+    ) -> Option<CircuitBreakerEvent> {
+        if is_winner {
+            self.consecutive_loss_count = 0;
+            return None;
+        }
+
+        // Loss: increment the counter.
+        self.consecutive_loss_count = self.consecutive_loss_count.saturating_add(1);
+
+        if matches!(self.consecutive_losses_state, BreakerState::Tripped) {
+            // Already tripped — keep counting for the contextual field
+            // but don't re-trip.
+            return None;
+        }
+
+        if self.consecutive_loss_count >= self.consecutive_loss_limit {
+            let evt = self.trip_breaker(
+                BreakerType::ConsecutiveLosses,
+                format!(
+                    "{} consecutive losses reached limit {}",
+                    self.consecutive_loss_count, self.consecutive_loss_limit
+                ),
+                timestamp,
+            );
+            return Some(evt);
+        }
+        None
+    }
+
+    /// Increment the per-session trade counter and trip the
+    /// max-trades-per-day **breaker** when the count exceeds the limit.
+    ///
+    /// "Exceeds" means strictly greater than: the threshold itself (e.g.
+    /// `max_trades_per_day = 30`) is the LAST permitted trade count. The
+    /// trip happens on the (limit + 1)th trade.
+    ///
+    /// Like all breakers, this requires manual reset (= process restart).
+    /// The count itself never resets within a session.
+    pub fn record_trade(&mut self, timestamp: UnixNanos) -> Option<CircuitBreakerEvent> {
+        self.trade_count = self.trade_count.saturating_add(1);
+
+        if matches!(self.max_trades_state, BreakerState::Tripped) {
+            return None;
+        }
+
+        if self.trade_count > self.max_trades_limit {
+            let evt = self.trip_breaker(
+                BreakerType::MaxTrades,
+                format!(
+                    "{} trades exceeds daily limit {}",
+                    self.trade_count, self.max_trades_limit
+                ),
+                timestamp,
+            );
+            return Some(evt);
+        }
+        None
+    }
+
+    /// Test-only / forensic accessor for the cached daily-loss value.
+    #[doc(hidden)]
+    pub fn daily_loss_current(&self) -> i64 {
+        self.daily_loss_current
+    }
+
+    /// Test-only / forensic accessor for the consecutive-loss counter.
+    #[doc(hidden)]
+    pub fn consecutive_loss_count(&self) -> u32 {
+        self.consecutive_loss_count
+    }
+
+    /// Test-only / forensic accessor for the per-session trade count.
+    #[doc(hidden)]
+    pub fn trade_count(&self) -> u32 {
+        self.trade_count
+    }
 }
 
 /// Per-tick gate evaluation snapshot. Stories 5.2–5.6 produce this from
@@ -883,5 +1092,438 @@ mod tests {
         // First trip emits, second is a no-op.
         assert!(alerts_rx.try_recv().is_ok());
         assert!(alerts_rx.try_recv().is_err());
+    }
+
+    // ================================================================
+    // Story 5.2 — position & loss-limit breakers / gate
+    // ================================================================
+
+    /// Task 6.1 — max-position-size gate trips at the limit and auto-clears
+    /// when the position drops back inside the budget.
+    #[test]
+    fn max_position_size_gate_trips_and_auto_clears() {
+        // Limit = 2 from `test_config()`.
+        let (mut cb, rx) = fixture();
+
+        // At the limit ⇒ trip.
+        let trip = cb
+            .check_position_size(2, UnixNanos::new(1))
+            .expect("expected trip at limit");
+        assert_eq!(trip.breaker_type, BreakerType::MaxPositionSize);
+        assert_eq!(trip.new_state, BreakerState::Tripped);
+        assert_eq!(
+            cb.state(BreakerType::MaxPositionSize),
+            BreakerState::Tripped
+        );
+        assert!(cb.permits_trading().is_err());
+        // Drain the trip event.
+        let _ = rx.try_recv().unwrap();
+
+        // Reduce the position below the limit ⇒ auto-clear.
+        let clear = cb
+            .check_position_size(1, UnixNanos::new(2))
+            .expect("expected auto-clear when within limits");
+        assert_eq!(clear.breaker_type, BreakerType::MaxPositionSize);
+        assert_eq!(clear.new_state, BreakerState::Cleared);
+        assert_eq!(cb.state(BreakerType::MaxPositionSize), BreakerState::Active);
+        assert!(cb.permits_trading().is_ok());
+
+        // The clearance event was journaled.
+        let evt = rx.try_recv().expect("clearance event must be on channel");
+        assert_eq!(evt.new_state, BreakerState::Cleared);
+    }
+
+    /// Max-position-size: short side mirrors long side (abs() comparison).
+    #[test]
+    fn max_position_size_uses_absolute_value() {
+        let (mut cb, _rx) = fixture();
+        // Short of 2 contracts ⇒ |−2| = 2 == limit ⇒ trip.
+        let evt = cb.check_position_size(-2, UnixNanos::new(1));
+        assert!(evt.is_some());
+        assert_eq!(
+            cb.state(BreakerType::MaxPositionSize),
+            BreakerState::Tripped
+        );
+    }
+
+    /// `update_gate_conditions(...)` continues to integrate with the
+    /// max-position-size gate when callers pre-evaluate the condition
+    /// themselves (the framework's pre-existing API surface).
+    #[test]
+    fn max_position_size_clears_via_update_gate_conditions() {
+        let (mut cb, _rx) = fixture();
+        cb.trip_breaker(
+            BreakerType::MaxPositionSize,
+            "external trip".into(),
+            UnixNanos::new(1),
+        );
+        cb.update_gate_conditions(
+            &GateConditions {
+                max_position_size_tripped: false,
+                ..Default::default()
+            },
+            UnixNanos::new(2),
+        );
+        assert_eq!(cb.state(BreakerType::MaxPositionSize), BreakerState::Active);
+    }
+
+    /// Task 6.2 — daily-loss breaker trips when cumulative loss exceeds
+    /// the configured cap.
+    #[test]
+    fn daily_loss_breaker_trips_at_cap() {
+        // `test_config()` has max_daily_loss_ticks = 1000.
+        let (mut cb, _rx) = fixture();
+
+        // Loss of 999 ticks ⇒ within budget.
+        assert!(cb.update_daily_loss(-999, 0, UnixNanos::new(1)).is_none());
+        assert!(cb.permits_trading().is_ok());
+
+        // Loss of 1001 ticks ⇒ trip.
+        let evt = cb
+            .update_daily_loss(-1001, 0, UnixNanos::new(2))
+            .expect("expected trip");
+        assert_eq!(evt.breaker_type, BreakerType::DailyLoss);
+        assert_eq!(cb.state(BreakerType::DailyLoss), BreakerState::Tripped);
+    }
+
+    /// Daily-loss trips at exact-equal threshold (≤ −limit).
+    #[test]
+    fn daily_loss_trips_at_exact_threshold() {
+        let (mut cb, _rx) = fixture();
+        let evt = cb.update_daily_loss(-1000, 0, UnixNanos::new(1));
+        assert!(evt.is_some(), "trip on exact equal to cap");
+    }
+
+    /// Task 6.3 — daily-loss breaker does NOT auto-clear if P&L recovers.
+    #[test]
+    fn daily_loss_does_not_auto_clear_on_recovery() {
+        let (mut cb, _rx) = fixture();
+
+        // Trip the breaker.
+        cb.update_daily_loss(-1500, 0, UnixNanos::new(1)).unwrap();
+        assert_eq!(cb.state(BreakerType::DailyLoss), BreakerState::Tripped);
+
+        // Big positive P&L recovery — breaker MUST stay tripped.
+        cb.update_daily_loss(500, 200, UnixNanos::new(2));
+        assert_eq!(
+            cb.state(BreakerType::DailyLoss),
+            BreakerState::Tripped,
+            "daily loss is a breaker; recovery must NOT auto-clear"
+        );
+        assert!(cb.permits_trading().is_err());
+
+        // Even the cached `daily_loss_current` is updated for context...
+        assert_eq!(cb.daily_loss_current(), 700);
+        // ...but the breaker stays tripped until manual reset.
+        cb.reset_breaker(BreakerType::DailyLoss);
+        assert_eq!(cb.state(BreakerType::DailyLoss), BreakerState::Active);
+    }
+
+    /// Task 6.4 — daily-loss includes both realized and unrealized
+    /// components.
+    #[test]
+    fn daily_loss_aggregates_realized_and_unrealized() {
+        let (mut cb, _rx) = fixture();
+
+        // Realized -700 + unrealized -400 = total -1100 ⇒ over the 1000 cap.
+        let evt = cb
+            .update_daily_loss(-700, -400, UnixNanos::new(1))
+            .expect("expected trip when sum exceeds cap");
+        assert_eq!(evt.breaker_type, BreakerType::DailyLoss);
+        assert_eq!(cb.daily_loss_current(), -1100);
+    }
+
+    /// Task 6.5 — consecutive-loss counter increments on losses, resets
+    /// on a winning trade.
+    #[test]
+    fn consecutive_loss_counter_increments_then_resets_on_win() {
+        let (mut cb, _rx) = fixture();
+
+        // Two losses, no trip yet (limit = 3).
+        cb.record_trade_result(false, UnixNanos::new(1));
+        cb.record_trade_result(false, UnixNanos::new(2));
+        assert_eq!(cb.consecutive_loss_count(), 2);
+        assert_eq!(
+            cb.state(BreakerType::ConsecutiveLosses),
+            BreakerState::Active
+        );
+
+        // A winner resets the counter to 0.
+        cb.record_trade_result(true, UnixNanos::new(3));
+        assert_eq!(cb.consecutive_loss_count(), 0);
+        assert!(cb.permits_trading().is_ok());
+    }
+
+    /// Task 6.6 — consecutive-loss breaker trips at exactly the configured
+    /// threshold (3rd consecutive loss when limit = 3).
+    #[test]
+    fn consecutive_loss_breaker_trips_at_limit() {
+        let (mut cb, _rx) = fixture();
+        // 3rd loss in a row should trip (limit = 3).
+        assert!(cb.record_trade_result(false, UnixNanos::new(1)).is_none());
+        assert!(cb.record_trade_result(false, UnixNanos::new(2)).is_none());
+        let evt = cb
+            .record_trade_result(false, UnixNanos::new(3))
+            .expect("expected trip at limit");
+        assert_eq!(evt.breaker_type, BreakerType::ConsecutiveLosses);
+        assert_eq!(
+            cb.state(BreakerType::ConsecutiveLosses),
+            BreakerState::Tripped
+        );
+    }
+
+    /// Task 6.7 — counter resets on a winning trade EVEN when the breaker
+    /// is tripped. The counter and the breaker state are independent: a
+    /// manual reset moves the breaker but NOT the counter; a winner
+    /// always zeroes the counter.
+    #[test]
+    fn consecutive_loss_counter_resets_on_win_even_when_tripped() {
+        let (mut cb, _rx) = fixture();
+
+        // Trip the breaker via 3 consecutive losses.
+        cb.record_trade_result(false, UnixNanos::new(1));
+        cb.record_trade_result(false, UnixNanos::new(2));
+        cb.record_trade_result(false, UnixNanos::new(3));
+        assert_eq!(
+            cb.state(BreakerType::ConsecutiveLosses),
+            BreakerState::Tripped
+        );
+
+        // A winner — the breaker stays tripped (manual-reset rule), but the
+        // counter resets.
+        cb.record_trade_result(true, UnixNanos::new(4));
+        assert_eq!(cb.consecutive_loss_count(), 0);
+        assert_eq!(
+            cb.state(BreakerType::ConsecutiveLosses),
+            BreakerState::Tripped
+        );
+
+        // Now, if the operator manually resets the breaker, subsequent
+        // losses count from 0 (because the winner already zeroed the
+        // counter).
+        cb.reset_breaker(BreakerType::ConsecutiveLosses);
+        assert_eq!(cb.consecutive_loss_count(), 0);
+        cb.record_trade_result(false, UnixNanos::new(5));
+        assert_eq!(cb.consecutive_loss_count(), 1);
+        assert_eq!(
+            cb.state(BreakerType::ConsecutiveLosses),
+            BreakerState::Active
+        );
+    }
+
+    /// Counter survives a manual breaker reset that is NOT preceded by
+    /// a winning trade. This is the "reset and immediately blow through"
+    /// guard from the architecture spec: if the operator resets after the
+    /// breaker tripped at 3, and the very next trade is a loss, the
+    /// counter continues from 3 ⇒ 4 ⇒ trip immediately.
+    #[test]
+    fn manual_reset_does_not_zero_consecutive_counter() {
+        let (mut cb, _rx) = fixture();
+        // Trip via 3 losses in a row.
+        cb.record_trade_result(false, UnixNanos::new(1));
+        cb.record_trade_result(false, UnixNanos::new(2));
+        cb.record_trade_result(false, UnixNanos::new(3));
+        assert_eq!(
+            cb.state(BreakerType::ConsecutiveLosses),
+            BreakerState::Tripped
+        );
+        assert_eq!(cb.consecutive_loss_count(), 3);
+
+        // Operator resets the breaker but NO winning trade has occurred.
+        cb.reset_breaker(BreakerType::ConsecutiveLosses);
+        assert_eq!(
+            cb.consecutive_loss_count(),
+            3,
+            "manual reset must NOT zero the loss counter"
+        );
+
+        // The next loss takes us back over the threshold ⇒ trip again.
+        let evt = cb
+            .record_trade_result(false, UnixNanos::new(4))
+            .expect("expected immediate re-trip");
+        assert_eq!(evt.breaker_type, BreakerType::ConsecutiveLosses);
+    }
+
+    /// Task 6.8 — max-trades-per-day breaker trips when the count exceeds
+    /// the configured limit.
+    #[test]
+    fn max_trades_breaker_trips_when_exceeded() {
+        // limit = 30 from `test_config()`.
+        let (mut cb, _rx) = fixture();
+        for i in 1..=30u32 {
+            assert!(
+                cb.record_trade(UnixNanos::new(i as u64)).is_none(),
+                "trip too early at {i}"
+            );
+        }
+        // 31st trade pushes us over the cap.
+        let evt = cb
+            .record_trade(UnixNanos::new(31))
+            .expect("expected trip on (limit+1)th trade");
+        assert_eq!(evt.breaker_type, BreakerType::MaxTrades);
+        assert_eq!(cb.state(BreakerType::MaxTrades), BreakerState::Tripped);
+        assert_eq!(cb.trade_count(), 31);
+    }
+
+    /// Max-trades count never auto-resets within a session even after a
+    /// manual breaker reset (the count itself is by-design a session-life
+    /// counter; the breaker state is what manual reset clears).
+    #[test]
+    fn max_trades_count_persists_across_manual_reset() {
+        let (mut cb, _rx) = fixture();
+        for i in 1..=31u32 {
+            cb.record_trade(UnixNanos::new(i as u64));
+        }
+        assert_eq!(cb.state(BreakerType::MaxTrades), BreakerState::Tripped);
+
+        cb.reset_breaker(BreakerType::MaxTrades);
+        assert_eq!(cb.state(BreakerType::MaxTrades), BreakerState::Active);
+        // Count is preserved.
+        assert_eq!(cb.trade_count(), 31);
+        // Next trade re-trips immediately.
+        let evt = cb.record_trade(UnixNanos::new(32));
+        assert!(evt.is_some());
+    }
+
+    /// Task 6.9 — all four 5.2 breakers/gate can be tripped simultaneously
+    /// and `permits_trading()` reports every denial reason.
+    #[test]
+    fn all_four_breakers_trip_simultaneously() {
+        let (mut cb, _rx) = fixture();
+
+        // 1) Position size gate (limit 2).
+        cb.check_position_size(2, UnixNanos::new(1));
+        // 2) Daily loss (limit 1000 ticks).
+        cb.update_daily_loss(-2000, 0, UnixNanos::new(2));
+        // 3) Consecutive losses (limit 3).
+        cb.record_trade_result(false, UnixNanos::new(3));
+        cb.record_trade_result(false, UnixNanos::new(4));
+        cb.record_trade_result(false, UnixNanos::new(5));
+        // 4) Max trades (limit 30).
+        for i in 0..31u32 {
+            cb.record_trade(UnixNanos::new(100 + i as u64));
+        }
+
+        let denied = cb.permits_trading().unwrap_err();
+        assert!(denied.contains(BreakerType::MaxPositionSize));
+        assert!(denied.contains(BreakerType::DailyLoss));
+        assert!(denied.contains(BreakerType::ConsecutiveLosses));
+        assert!(denied.contains(BreakerType::MaxTrades));
+        assert_eq!(denied.reasons.len(), 4);
+    }
+
+    /// Task 6.10 — config thresholds drive the limits. Different config
+    /// values produce different trip thresholds.
+    #[test]
+    fn config_thresholds_drive_trip_points() {
+        let (tx, _rx) = unbounded();
+        let config = TradingConfig {
+            symbol: "ES".into(),
+            max_position_size: 5,
+            max_daily_loss_ticks: 250,
+            max_consecutive_losses: 7,
+            max_trades_per_day: 100,
+            edge_multiple_threshold: 1.5,
+            session_start: "09:30".into(),
+            session_end: "16:00".into(),
+            max_spread_threshold: FixedPrice::new(4),
+            fee_schedule_date: chrono::Utc::now().date_naive(),
+            events: Vec::new(),
+        };
+        let mut cb = CircuitBreakers::new(&config, tx);
+
+        // Position size: 4 OK, 5 trips.
+        assert!(cb.check_position_size(4, UnixNanos::new(1)).is_none());
+        assert!(cb.check_position_size(5, UnixNanos::new(2)).is_some());
+
+        // Daily loss: -200 OK, -300 trips against the 250 cap.
+        let (tx2, _rx2) = unbounded();
+        let mut cb2 = CircuitBreakers::new(&config, tx2);
+        assert!(cb2.update_daily_loss(-200, 0, UnixNanos::new(1)).is_none());
+        assert!(cb2.update_daily_loss(-300, 0, UnixNanos::new(2)).is_some());
+
+        // Consecutive losses: 6 not trip, 7 trips.
+        let (tx3, _rx3) = unbounded();
+        let mut cb3 = CircuitBreakers::new(&config, tx3);
+        for i in 0..6 {
+            assert!(
+                cb3.record_trade_result(false, UnixNanos::new(i as u64))
+                    .is_none()
+            );
+        }
+        assert!(cb3.record_trade_result(false, UnixNanos::new(99)).is_some());
+
+        // Max trades: 100 OK, 101 trips.
+        let (tx4, _rx4) = unbounded();
+        let mut cb4 = CircuitBreakers::new(&config, tx4);
+        for i in 0..100u32 {
+            assert!(cb4.record_trade(UnixNanos::new(i as u64)).is_none());
+        }
+        assert!(cb4.record_trade(UnixNanos::new(200)).is_some());
+    }
+
+    /// Task 5 integration: simulate the full event-loop call sequence
+    /// (decision → permits_trading → submit → fill → record outcome →
+    /// position update). The test verifies that the breaker hooks are
+    /// composable in the expected order without surprising state
+    /// interactions.
+    #[test]
+    fn event_loop_call_sequence_integration() {
+        let (mut cb, _rx) = fixture();
+        let mut now = 0u64;
+        let mut tick = || -> UnixNanos {
+            now += 1;
+            UnixNanos::new(now)
+        };
+
+        // Trade #1: pre-flight checks pass.
+        assert!(cb.permits_trading().is_ok());
+        // Submit + fill, position +1.
+        cb.record_trade(tick());
+        cb.check_position_size(1, tick());
+        // Mark to market, P&L still healthy.
+        cb.update_daily_loss(-50, 10, tick());
+        // Trade resolves as a winner.
+        cb.record_trade_result(true, tick());
+
+        // Trade #2: same flow, position +2 reaches the gate.
+        assert!(cb.permits_trading().is_ok());
+        cb.record_trade(tick());
+        let trip = cb.check_position_size(2, tick());
+        assert!(trip.is_some(), "position-size gate must trip at limit");
+
+        // Now `permits_trading()` MUST deny.
+        let denied = cb.permits_trading().unwrap_err();
+        assert!(denied.contains(BreakerType::MaxPositionSize));
+
+        // After flatten back to 0, the gate auto-clears.
+        let clear = cb.check_position_size(0, tick());
+        assert!(clear.is_some());
+        assert!(cb.permits_trading().is_ok());
+    }
+
+    /// Re-tripping the position-size gate while already tripped is a no-op
+    /// (no duplicate journal events).
+    #[test]
+    fn position_size_re_trip_is_idempotent() {
+        let (mut cb, rx) = fixture();
+        cb.check_position_size(2, UnixNanos::new(1)).unwrap();
+        let _first = rx.try_recv().unwrap();
+
+        // Still over the limit on the next call — no duplicate event.
+        let evt = cb.check_position_size(3, UnixNanos::new(2));
+        assert!(evt.is_none(), "duplicate trip must not emit a new event");
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// `update_daily_loss` saturating-add does not overflow on extreme
+    /// inputs (defence against arithmetic accidents from upstream code).
+    #[test]
+    fn update_daily_loss_saturates() {
+        let (mut cb, _rx) = fixture();
+        // i64::MIN + i64::MIN would overflow naive addition; saturating
+        // arithmetic clamps to i64::MIN which is well past any realistic cap.
+        cb.update_daily_loss(i64::MIN, i64::MIN, UnixNanos::new(1));
+        assert_eq!(cb.state(BreakerType::DailyLoss), BreakerState::Tripped);
     }
 }

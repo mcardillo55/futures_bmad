@@ -83,7 +83,7 @@ development_status:
   # Epic 5: Risk Management & Circuit Breakers
   epic-5: in-progress
   5-1-circuit-breaker-framework: review
-  5-2-position-and-loss-limit-breakers: ready-for-dev
+  5-2-position-and-loss-limit-breakers: review
   5-3-anomalous-position-detection-and-panic-mode: ready-for-dev
   5-4-infrastructure-breakers: ready-for-dev
   5-5-event-aware-trading-windows: review

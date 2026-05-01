@@ -1,8 +1,12 @@
 use chrono::NaiveDate;
-use futures_bmad_core::{Clock, FeeConfig, FixedPrice};
-use tracing::{error, warn};
+use futures_bmad_core::{FeeConfig, FixedPrice};
 
 /// Reason why the fee gate blocked or permitted a trade.
+///
+/// Pre-Epic-6 cleanup D-3: the `StaleSchedule` variant has been removed.
+/// Fee-staleness is now owned exclusively by
+/// [`crate::risk::CircuitBreakers::check_fee_staleness`] / the
+/// `FeeStaleness` gate. `FeeGate` is pure economics (edge vs fee).
 #[derive(Debug, Clone, PartialEq)]
 pub enum FeeGateReason {
     Permitted,
@@ -10,19 +14,20 @@ pub enum FeeGateReason {
         edge: FixedPrice,
         threshold: FixedPrice,
     },
-    StaleSchedule {
-        days: u64,
-    },
 }
 
 /// Fee-aware trade gating.
 ///
-/// Computes total round-trip cost and blocks trades unless expected edge
-/// exceeds a configurable multiple of total cost. Staleness gate blocks
-/// all trade evaluations when fee schedule is >60 days old, warns at >30 days.
+/// Pure economics: blocks trades when expected edge does not exceed a
+/// configurable multiple of total round-trip cost. Pre-Epic-6 cleanup D-3
+/// removed the `>60 days` staleness branch from this gate; staleness is
+/// now owned by [`crate::risk::CircuitBreakers::check_fee_staleness`] —
+/// both the gate (`BreakerType::FeeStaleness`) and the optional
+/// `tracing::warn!` at the >30-day threshold live there. This gate keeps
+/// the `fee_schedule_date` field for cost computation and FYI only.
 ///
-/// CRITICAL: Staleness gate never blocks flattening or safety orders.
-/// Callers must use `permits_flatten()` for safety orders.
+/// CRITICAL: Flattening / safety orders must always use
+/// [`Self::permits_flatten`].
 pub struct FeeGate {
     pub exchange_fee_per_side: FixedPrice,
     pub commission_per_side: FixedPrice,
@@ -64,33 +69,21 @@ impl FeeGate {
             .saturating_add(self.slippage_model)
     }
 
-    /// Check if a trade with the given expected edge is permitted.
+    /// Check if a trade with the given expected edge is permitted on
+    /// pure economics: returns `Ok(true)` if `expected_edge >
+    /// minimum_edge_multiple * total_round_trip_cost`, `Ok(false)`
+    /// otherwise.
     ///
-    /// Returns `Ok(true)` if permitted, `Ok(false)` if edge below threshold,
-    /// or `Err(FeeGateReason::StaleSchedule)` if fee schedule is >60 days stale.
+    /// Pre-Epic-6 cleanup D-3: this method NO LONGER consults fee
+    /// staleness. Staleness lives on
+    /// [`crate::risk::CircuitBreakers::check_fee_staleness`] /
+    /// `BreakerType::FeeStaleness`. The previously-retained `clock`
+    /// parameter has been dropped — there is no economics-time-of-day
+    /// branch in this gate today.
     pub fn permits_trade(
         &self,
         expected_edge: FixedPrice,
-        clock: &dyn Clock,
     ) -> Result<bool, FeeGateReason> {
-        // Check staleness
-        let today = clock.wall_clock().date_naive();
-        let days_since = (today - self.fee_schedule_date).num_days();
-
-        if days_since > 60 {
-            error!(
-                days = days_since,
-                "Fee schedule >60 days stale, blocking trades"
-            );
-            return Err(FeeGateReason::StaleSchedule {
-                days: days_since as u64,
-            });
-        }
-
-        if days_since > 30 {
-            warn!(days = days_since, "Fee schedule >30 days stale");
-        }
-
         // Compute minimum edge threshold
         let cost = self.total_round_trip_cost();
         let threshold_f64 = self.minimum_edge_multiple * cost.to_f64();
@@ -103,7 +96,7 @@ impl FeeGate {
         }
     }
 
-    /// Flattening and safety orders are NEVER gated by staleness or edge threshold.
+    /// Flattening and safety orders are NEVER gated by edge threshold.
     pub fn permits_flatten(&self) -> bool {
         true
     }

@@ -2,7 +2,7 @@ use futures_bmad_core::{Clock, FixedPrice, Side, Signal};
 use tracing::info;
 
 use super::SignalPipeline;
-use crate::risk::fee_gate::{FeeGate, FeeGateReason};
+use crate::risk::fee_gate::FeeGate;
 
 /// Configuration for composite signal weighting.
 #[derive(Debug, Clone)]
@@ -56,7 +56,7 @@ impl CompositeEvaluator {
         &mut self,
         pipeline: &SignalPipeline,
         fee_gate: &FeeGate,
-        clock: &dyn Clock,
+        _clock: &dyn Clock,
     ) -> TradeDecision {
         self.decision_counter += 1;
         let decision_id = self.decision_counter;
@@ -122,27 +122,14 @@ impl CompositeEvaluator {
         let edge_f64 = score.abs() * self.config.historical_edge_per_unit;
         let expected_edge = FixedPrice::from_f64(edge_f64).unwrap_or(FixedPrice::new(0));
 
-        // Check fee gate
-        match fee_gate.permits_trade(expected_edge, clock) {
-            Err(FeeGateReason::StaleSchedule { days }) => {
-                let reason = DecisionReason::NoTradeFeeGateBlocked;
-                info!(
-                    decision_id,
-                    stale_days = days,
-                    reason = ?reason,
-                    "no-trade decision"
-                );
-                return TradeDecision {
-                    decision_id,
-                    direction,
-                    expected_edge,
-                    composite_score: score,
-                    obi_value: obi_val,
-                    vpin_value: vpin_val,
-                    microprice_value: mp_val,
-                    reason,
-                };
-            }
+        // Check fee gate (pure economics: edge vs fee).
+        //
+        // Pre-Epic-6 cleanup D-3: fee-staleness is no longer surfaced by
+        // `FeeGate::permits_trade` — `CircuitBreakers::check_fee_staleness`
+        // owns it via the `FeeStaleness` gate, and any caller that needs
+        // to short-circuit on staleness consults
+        // `CircuitBreakers::permits_trade_evaluation` BEFORE this point.
+        match fee_gate.permits_trade(expected_edge) {
             Ok(false) => {
                 let reason = DecisionReason::NoTradeEdgeBelowThreshold;
                 info!(
@@ -164,7 +151,27 @@ impl CompositeEvaluator {
                 };
             }
             Ok(true) => {}
-            Err(_) => {} // EdgeBelowThreshold/Permitted — not returned by permits_trade
+            Err(_) => {
+                // EdgeBelowThreshold / Permitted are not returned by
+                // permits_trade today; the staleness branch was removed in
+                // D-3. Treat any unexpected Err as conservative no-trade.
+                let reason = DecisionReason::NoTradeFeeGateBlocked;
+                info!(
+                    decision_id,
+                    reason = ?reason,
+                    "no-trade decision (unexpected fee-gate error)"
+                );
+                return TradeDecision {
+                    decision_id,
+                    direction,
+                    expected_edge,
+                    composite_score: score,
+                    obi_value: obi_val,
+                    vpin_value: vpin_val,
+                    microprice_value: mp_val,
+                    reason,
+                };
+            }
         }
 
         // All conditions met — trade

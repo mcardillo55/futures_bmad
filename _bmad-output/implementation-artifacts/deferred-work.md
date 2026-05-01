@@ -88,14 +88,14 @@ Note: S-2 from this review (partial entry over-sizes SL/TP via warn-only) is the
 
 ## Deferred from: code review of story-5.3 (2026-04-30)
 
-- **B-1 (LIVE-TRADING EXIT GATE; close before Epic 6):** `CircuitBreakers` has no `panic_mode: bool` field; `permits_trading()` does not consult panic mode; no `DenialReason::PanicModeActive` variant. Two parallel "can we trade?" gates exist (`CircuitBreakers::permits_trading` and `PanicMode::is_trading_enabled`) and every order-submission path must remember to check both. AC for "Task 5: CircuitBreakers integration with panic mode" not satisfied. [`crates/engine/src/risk/circuit_breakers.rs`, `crates/engine/src/risk/panic_mode.rs`]
-- **B-2 (LIVE-TRADING EXIT GATE; close before Epic 6):** `check_position_anomaly` and `handle_anomaly` have NO production caller. `handle_anomaly` is documented as "intended to be `tokio::spawn`-ed onto the broker runtime" but the spawn never happens. AC for "Given position outside active strategy context When detected Then anomalous position breaker activates, automated flatten submitted" is not satisfied at integration level. [`crates/engine/src/risk/anomaly_handler.rs`]
+- [x] **B-1 (LIVE-TRADING EXIT GATE; close before Epic 6):** `CircuitBreakers` has no `panic_mode: bool` field; `permits_trading()` does not consult panic mode; no `DenialReason::PanicModeActive` variant. Two parallel "can we trade?" gates exist (`CircuitBreakers::permits_trading` and `PanicMode::is_trading_enabled`) and every order-submission path must remember to check both. AC for "Task 5: CircuitBreakers integration with panic mode" not satisfied. **Resolved in pre-Epic-6 cleanup commit:** `CircuitBreakers` now holds `panic_mode: Arc<PanicMode>`; both `permits_trading` and `permits_trade_evaluation` consult it FIRST and prepend `DenialReason::PanicModeActive` to `reasons` when active. [`crates/engine/src/risk/circuit_breakers.rs`, `crates/engine/src/risk/panic_mode.rs`]
+- [x] **B-2 (LIVE-TRADING EXIT GATE; close before Epic 6):** `check_position_anomaly` and `handle_anomaly` have NO production caller. `handle_anomaly` is documented as "intended to be `tokio::spawn`-ed onto the broker runtime" but the spawn never happens. AC for "Given position outside active strategy context When detected Then anomalous position breaker activates, automated flatten submitted" is not satisfied at integration level. **Resolved (producer side) in pre-Epic-6 cleanup commit:** `EventLoop::attach_anomaly_detection(tracker, expected, sender, journal)` wires the per-tick anomaly producer; on `AnomalyCheckOutcome::Anomalous` it `try_send`s a `FlattenRequest` on a `tokio::sync::mpsc::Sender<FlattenRequest>` (full channel ⇒ warn + journal `flatten_request_dropped`). The matching `Receiver<FlattenRequest>` drain and the async `handle_anomaly` consumer task remain owned by Story 8.2. [`crates/engine/src/risk/anomaly_handler.rs`, `crates/engine/src/event_loop.rs`]
 - S-1: `flatten_failure_activates_panic_mode_with_context` test was relaxed during rebase — no longer asserts the journal `SystemEvent` carries "attempt 1/2/3" detail. Detail flows through operator-alert channel (5.6) instead. Document the assertion split or restore the journal assertion. [`crates/engine/src/risk/anomaly_handler.rs`]
 - N-1 through N-4: rebase-induced test coverage gaps and minor doc-drift.
 
 ## Deferred from: code review of story-5.4 (2026-04-30)
 
-- **P1 (LIVE-TRADING EXIT GATE; close before Epic 6):** Task 3.6 not executed — `fee_gate.rs` is unchanged. Two parallel fee-staleness implementations exist: `FeeGate::permits_trade` does its own `>60 days` check returning `FeeGateReason::StaleSchedule`, and the new `CircuitBreakers::check_fee_staleness` does the same against its own state. Nothing reconciles them. Pick one canonical owner; delete the other path or have it forward to the canonical one. [`crates/engine/src/risk/fee_gate.rs`, `crates/engine/src/risk/circuit_breakers.rs`]
+- [x] **P1 (LIVE-TRADING EXIT GATE; close before Epic 6):** Task 3.6 not executed — `fee_gate.rs` is unchanged. Two parallel fee-staleness implementations exist: `FeeGate::permits_trade` does its own `>60 days` check returning `FeeGateReason::StaleSchedule`, and the new `CircuitBreakers::check_fee_staleness` does the same against its own state. Nothing reconciles them. Pick one canonical owner; delete the other path or have it forward to the canonical one. **Resolved in pre-Epic-6 cleanup commit:** `FeeGateReason::StaleSchedule` and the `>60 days` branch removed from `FeeGate::permits_trade`; the relocated `>30 days` `tracing::warn!` lives in `CircuitBreakers::check_fee_staleness`. `FeeGate` is now pure economics (edge vs fee); `CircuitBreakers::check_fee_staleness` / `BreakerType::FeeStaleness` is the sole staleness owner. [`crates/engine/src/risk/fee_gate.rs`, `crates/engine/src/risk/circuit_breakers.rs`]
 - D1: `permits_trading()` vs `permits_trade_evaluation()` have identical signatures, distinguished only by docstring severity. The split-API contract lives entirely in tests and docstrings — no consumer outside the risk module invokes either. Decide before story 8-2 wiring whether to (a) keep docstring-only, (b) tag intent via parameter (`intent: TradeIntent`), or (c) return a tagged type. [`crates/engine/src/risk/circuit_breakers.rs`]
 - P2/P3/P4: minor patches (logging cleanup, test naming, edge-case coverage). Apply in a focused follow-up commit.
 - W1–W4: defer items (forward-looking caveats and pre-existing concerns).
@@ -122,6 +122,22 @@ Note: S-2 from this review (partial entry over-sizes SL/TP via warn-only) is the
 
 - **Worktree-merge-at-end pattern produced partially-stale integration code.** Stories 5.2–5.6 were developed in parallel worktrees, several rooted on pre-5.1 main. Story 5.3 explicitly: *"developed against a stale main (pre-5.1 merge) and surgically rebased into the post-5.1+5.2+5.4+5.6 framework on integration."* Tasks were checked ✅ in worktrees against the stub framework but the rebase didn't carry integration wiring forward against the new framework. **Resolution:** Action item P-1 in epic-5-retro-2026-05-01.md — framework-first merge order with integrators rebasing onto merged main BEFORE declaring tasks done. In effect for Epic 6 onward.
 
+## Deferred from: review of pre-epic-6 cleanup spec (2026-05-01)
+
+- **Per-tick republication of `FlattenRequest` while `AnomalousPosition` latched-tripped** — Producer fires every tick that detects divergence; once consumer is wired (Story 8.2) without dedup, channel saturates and `flatten_request_dropped` floods the journal. Resolution: producer-side rising-edge detection (track last-published per symbol) OR consumer-side `(symbol_id, side, qty)` dedup with idempotency key. Owned by Story 8.2 integration. [`crates/engine/src/event_loop.rs` per-tick anomaly check]
+
+- **Flatten quantity uses `|actual|` not `|actual - expected|`** — Spec's I/O matrix only covered the `expected = 0` case. When Epic 6 wires non-zero strategy expectations, a tracker showing long-5 with strategy expecting long-2 would request a Sell-5 flatten, leaving naked short-2. Resolution: change `signed_position`-driven qty to `(cur - expected).unsigned_abs()` when Epic 6 ships. Owned by Epic 6 strategy-orchestrator integration. [`crates/engine/src/event_loop.rs` `check_anomalies_and_publish`]
+
+- **Anomaly iteration set = tracker keys only** — Symbols where strategy expects non-zero but tracker is flat are silently skipped (the loop iterates `position_tracker.iter()`). Resolution: iterate the union of `position_tracker.keys()` and `expected_positions.symbols()`. Requires `ExpectedPositionSource::symbols()` accessor (currently absent). Owned by Epic 6. [`crates/engine/src/event_loop.rs` per-tick anomaly check]
+
+- **`FlattenRequest { order_id: 0, decision_id: 0 }` sentinel contract unsettled** — Producer hardcodes zero with the convention that consumer (Story 8.2) allocates real IDs. The contract is only documented in the producer's inline comment. Resolution: either change `FlattenRequest` in `crates/broker/src/position_flatten.rs` to use `Option<u64>` for these fields, or have the consumer document the `0` sentinel in its allocation path. Owned by Story 8.2. [`crates/engine/src/event_loop.rs` FlattenRequest construction]
+
+- **`Arc<PositionTracker>` shared without interior mutability** — Producer holds `Option<Arc<PositionTracker>>` for read access, but `OrderManager::apply_fill` needs `&mut self` on the same tracker. Once Story 8.2 wires both sides, the `Arc` will need to wrap a `RwLock` or `Mutex`. Producer reads should use `read()`; writer-side `apply_fill` needs `write()`. Owned by Story 8.2 lifecycle wiring. [`crates/engine/src/event_loop.rs` `attach_anomaly_detection`]
+
+- **`check_fee_staleness` warn cadence** — Warn at >30 days fires on EVERY call. If Story 8.2 wires this onto the per-tick path (instead of per-minute or per-day), the warn floods at hot-path frequency. Resolution: throttle the warn to at-most-once-per-day OR call `check_fee_staleness` only on a low-frequency interval. Owned by Story 8.2. [`crates/engine/src/risk/circuit_breakers.rs::check_fee_staleness`]
+
+- **Producer fires `FlattenRequest` even while panic mode is active** — Once panic mode is engaged, `PanicMode::activate_with_context` fires its own flatten. The anomaly producer running in parallel can publish duplicate flattens. Resolution: producer skips when `breakers.panic_mode().is_trading_enabled() == false`, OR consumer (Story 8.2 `handle_anomaly` wrapper) checks panic state before submitting. Owned by Story 8.2. [`crates/engine/src/event_loop.rs` per-tick anomaly check]
+
 ---
 
 ## Live-Trading Exit Gates
@@ -130,17 +146,23 @@ Note: S-2 from this review (partial entry over-sizes SL/TP via warn-only) is the
 
 **Convention:** items are tracked in their original `## Deferred from:` section (with full context). This section is an INDEX that points back. To resolve: close in the original section by marking `[x]`, then mark resolved here.
 
-| ID | Source | Severity | Description | Target |
-|---|---|---|---|---|
-| 4-5 S-1 | story-4.5 review | HIGH | In-flight-fill / broker-query reconciliation race; periodic reconciliation will trip on this during fill bursts | Story 8.2 (lifecycle/startup, periodic reconciliation wire-up) |
-| 4-5 S-2 | story-4.5 review | HIGH | `trading_halted` flag set by reconciliation mismatch but never consulted by `OrderManager::submit_order` | Wire via Epic 5 CircuitBreaker framework — partially addressed by Story 5.1 (framework exists) but call-site wiring still pending Story 8.2 |
-| 4-5 S-3 / 4-3 S-2 / 4-4 S-2 | story-4.5 review | HIGH | Partial-entry SL/TP oversizing in `BracketManager::on_entry_fill`; Buy-5 partial-filled-3 → SL fires at 5 → flatten 3 + naked short 2 (NFR16 violation) | Panic-mode escalation pending; Story 5.3 framework exists but partial-entry trigger not wired |
-| **5-3 B-1** | story-5.3 review | HIGH | `CircuitBreakers::permits_trading()` doesn't consult panic mode; no `DenialReason::PanicModeActive` variant; two parallel "can we trade?" gates | **Pre-Epic-6 cleanup commit** |
-| **5-3 B-2** | story-5.3 review | HIGH | `check_position_anomaly` / `handle_anomaly` have no production caller — anomaly detection AC not satisfied at integration level | **Pre-Epic-6 cleanup commit** |
-| **5-4 P1** | story-5.4 review | HIGH | Fee-staleness duplicated between `FeeGate::permits_trade` and `CircuitBreakers::check_fee_staleness`; no reconciliation | **Pre-Epic-6 cleanup commit** |
+| ID | Source | Severity | Status | Description | Target |
+|---|---|---|---|---|---|
+| 4-5 S-1 | story-4.5 review | HIGH | OPEN | In-flight-fill / broker-query reconciliation race; periodic reconciliation will trip on this during fill bursts | Story 8.2 (lifecycle/startup, periodic reconciliation wire-up) |
+| 4-5 S-2 | story-4.5 review | HIGH | OPEN | `trading_halted` flag set by reconciliation mismatch but never consulted by `OrderManager::submit_order` | Wire via Epic 5 CircuitBreaker framework — partially addressed by Story 5.1 (framework exists) but call-site wiring still pending Story 8.2 |
+| 4-5 S-3 / 4-3 S-2 / 4-4 S-2 | story-4.5 review | HIGH | OPEN | Partial-entry SL/TP oversizing in `BracketManager::on_entry_fill`; Buy-5 partial-filled-3 → SL fires at 5 → flatten 3 + naked short 2 (NFR16 violation) | Panic-mode escalation pending; Story 5.3 framework exists but partial-entry trigger not wired |
+| ~~5-3 B-1~~ | story-5.3 review | HIGH | **RESOLVED (pre-Epic-6 cleanup)** | `CircuitBreakers::permits_trading()` now consults panic mode; `DenialReason::PanicModeActive` variant added and prepended to `reasons` when active. | — |
+| 5-3 B-2 | story-5.3 review | HIGH | **PRODUCER RESOLVED (pre-Epic-6 cleanup); CONSUMER OPEN** | Producer wired: `EventLoop::attach_anomaly_detection(...)` + per-tick `check_position_anomaly` + `try_send` `FlattenRequest` on `tokio::sync::mpsc::Sender<FlattenRequest>` (full-channel ⇒ warn + journal `flatten_request_dropped`). The matching `Receiver<FlattenRequest>` drain and the async `handle_anomaly` consumer task remain owned by Story 8.2. | Story 8.2 (consumer side) |
+| ~~5-4 P1~~ | story-5.4 review | HIGH | **RESOLVED (pre-Epic-6 cleanup)** | `FeeGateReason::StaleSchedule` deleted; `>60 days` branch removed from `FeeGate::permits_trade`; `>30 days` warn relocated to `CircuitBreakers::check_fee_staleness`. `CircuitBreakers::check_fee_staleness` / `BreakerType::FeeStaleness` is the sole staleness owner. | — |
 
-**Total open: 6 items.**
-- 3 carried from Epic 4 (target: Story 8.2)
-- 3 introduced by Epic 5 (target: pre-Epic-6 cleanup commit, per Epic 5 retro action items D-1, D-2, D-3)
+**Note on 5-3 B-2:** This row is split — the producer side resolved here in pre-Epic-6 cleanup, but the consumer side (the `Receiver<FlattenRequest>` drain and the `handle_anomaly` async task) remains Story 8.2's responsibility. The ID is intentionally NOT struck through to reflect that the gate is not yet fully closed.
+
+**Status summary (post pre-Epic-6 cleanup commit):**
+- 3 RESOLVED at the framework level (5-3 B-1, 5-3 B-2 producer, 5-4 P1).
+- 3 still OPEN, all targeting Story 8.2:
+  - 4-5 S-1 (reconciliation race)
+  - 4-5 S-2 — `OrderManager::submit_order` STILL does not call `CircuitBreakers::permits_trading()` / `permits_trade_evaluation()`. The framework now returns the right answer (D-1 closed) but the call-site wiring from `submit_order` is Story 8.2's.
+  - 4-5 S-3 / 4-3 S-2 / 4-4 S-2 (partial-entry SL/TP oversizing)
+- 5-3 B-2 partially open: the `EventLoop` producer is wired in this commit, but the matching `Receiver<FlattenRequest>` drain and the async `handle_anomaly` consumer task on the broker runtime are Story 8.2's.
 
 **Resolution discipline:** when closing, update the original `## Deferred from:` section with `[x]` and a one-line resolution note (commit hash if applicable). Then mark resolved here. DO NOT silently delete entries.

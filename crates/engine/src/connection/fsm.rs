@@ -98,8 +98,18 @@ mod tests {
         CircuitBreakers,
         crossbeam_channel::Receiver<CircuitBreakerEvent>,
     ) {
+        use std::sync::Arc;
+        use crate::persistence::journal::EventJournal;
+        use crate::risk::panic_mode::PanicMode;
+
         let (tx, rx) = unbounded();
-        (ConnectionFsm::new(), CircuitBreakers::new(&config(), tx), rx)
+        let (panic_tx, _panic_rx) = EventJournal::channel();
+        let panic_mode = Arc::new(PanicMode::new(panic_tx));
+        (
+            ConnectionFsm::new(),
+            CircuitBreakers::new(&config(), tx, panic_mode),
+            rx,
+        )
     }
 
     #[test]

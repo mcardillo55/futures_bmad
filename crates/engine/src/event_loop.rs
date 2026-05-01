@@ -1,19 +1,84 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use futures_bmad_core::{Clock, EventWindowConfig, FixedPrice, OrderBook, UnixNanos};
-use tracing::info;
+use futures_bmad_broker::FlattenRequest;
+use futures_bmad_core::{Clock, EventWindowConfig, FixedPrice, OrderBook, Side, UnixNanos};
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 use crate::buffer_monitor::{BufferMonitor, BufferState};
 use crate::data_quality::{
     DataQualityGate, GateReason, GateState, SequenceGapDetector, StaleDataDetector,
 };
 use crate::order_book::apply_market_event;
+use crate::order_manager::tracker::PositionTracker;
+use crate::persistence::journal::{
+    EngineEvent as JournalEvent, JournalSender, SystemEventRecord,
+};
+use crate::risk::circuit_breakers::AnomalyCheckOutcome;
 use crate::risk::{CircuitBreakers, EventWindowManager, TradingRestriction};
 use crate::spsc::MarketEventConsumer;
 
 /// How often to check for stale data (in loop iterations).
 const STALE_CHECK_INTERVAL: u64 = 1000;
+
+/// Pre-Epic-6 cleanup D-2: source of "expected position" lookups for the
+/// per-tick anomaly check.
+///
+/// Returns the sum of every active strategy's expected position for the
+/// given `symbol_id`, or `0` when no strategy currently claims it. The
+/// engine event loop calls this once per tracked symbol per anomaly-check
+/// pass and forwards the value to
+/// [`crate::risk::CircuitBreakers::check_position_anomaly`].
+///
+/// V1 (this commit) ships [`EmptyExpectedPositions`] — a default impl that
+/// always returns `0`, which means any non-zero PositionTracker entry is
+/// treated as "anomalous" until Epic 6's strategy orchestrator provides
+/// the real impl. Decoupling the trait from Epic 6's strategy code keeps
+/// this seam stable across the upcoming refactor.
+pub trait ExpectedPositionSource: Send + 'static {
+    fn expected_position(&self, symbol_id: u32) -> i32;
+
+    /// Used by attach_anomaly_detection to log a safety warning when the default impl is wired bare.
+    fn is_empty_default(&self) -> bool {
+        false
+    }
+}
+
+/// Compute the signed position from a [`futures_bmad_core::Position`]
+/// (positive for long, negative for short, 0 for flat / no side).
+fn signed_position(p: &futures_bmad_core::Position) -> i32 {
+    // saturate at i32::MAX — quantities that large indicate corrupt state, but we should not silently flip sign
+    let qty = i32::try_from(p.quantity).unwrap_or(i32::MAX);
+    match p.side {
+        Some(Side::Buy) => qty,
+        Some(Side::Sell) => -qty,
+        None => 0,
+    }
+}
+
+/// Default `ExpectedPositionSource` returning zero for every symbol.
+///
+/// **SAFETY:** With this default attached, EVERY non-zero `PositionTracker` entry is
+/// classified as anomalous and flatten requests are produced for it. Intended ONLY
+/// for tests and for the seam Epic 6's strategy orchestrator will replace.
+///
+/// Production deployments MUST attach a real `ExpectedPositionSource` before
+/// enabling live trading — otherwise the first held position triggers an immediate
+/// flatten.
+pub struct EmptyExpectedPositions;
+
+impl ExpectedPositionSource for EmptyExpectedPositions {
+    #[inline]
+    fn expected_position(&self, _symbol_id: u32) -> i32 {
+        0
+    }
+
+    #[inline]
+    fn is_empty_default(&self) -> bool {
+        true
+    }
+}
 
 /// Default max-spread threshold used by the order book's
 /// `is_tradeable()` check inside the event loop. Set when
@@ -55,6 +120,22 @@ pub struct EventLoop<C: Clock> {
     /// Captured guards for the breaker plumbing — currently just the
     /// max-spread threshold used by `OrderBook::is_tradeable()`.
     book_guards: Option<BookGuards>,
+    /// Pre-Epic-6 cleanup D-2: shared `PositionTracker` driving the
+    /// per-tick anomaly check. `None` when anomaly detection is not
+    /// attached. Held as `Arc` because reads-only — the writer side is
+    /// the engine's `OrderManager`.
+    position_tracker: Option<Arc<PositionTracker>>,
+    /// Pre-Epic-6 cleanup D-2: source of "expected" positions per symbol.
+    expected_positions: Option<Box<dyn ExpectedPositionSource>>,
+    /// Pre-Epic-6 cleanup D-2: producer side of the
+    /// `tokio::sync::mpsc::Sender<FlattenRequest>` channel. The matching
+    /// `Receiver` and the async `handle_anomaly` consumer task are owned
+    /// by Story 8.2.
+    flatten_tx: Option<mpsc::Sender<FlattenRequest>>,
+    /// Pre-Epic-6 cleanup D-2: journal sender used to record
+    /// `flatten_request_dropped` system events when the producer's
+    /// `try_send` returns `Full`.
+    anomaly_journal: Option<JournalSender>,
 }
 
 /// Handle for stopping the event loop from another thread.
@@ -99,6 +180,10 @@ impl<C: Clock> EventLoop<C> {
             running: Arc::new(AtomicBool::new(false)),
             breakers: None,
             book_guards: None,
+            position_tracker: None,
+            expected_positions: None,
+            flatten_tx: None,
+            anomaly_journal: None,
         }
     }
 
@@ -122,6 +207,55 @@ impl<C: Clock> EventLoop<C> {
     ) {
         self.breakers = Some(breakers);
         self.book_guards = Some(BookGuards { max_spread });
+    }
+
+    /// Pre-Epic-6 cleanup D-2: attach the per-tick anomaly-detection
+    /// producer.
+    ///
+    /// On each [`Self::tick`], if all three seams are present the loop
+    /// will:
+    ///
+    ///   1. Iterate every non-flat symbol in the attached
+    ///      [`PositionTracker`] snapshot.
+    ///   2. Look up the strategy-expected position via
+    ///      [`ExpectedPositionSource::expected_position`] (default impl
+    ///      returns 0 ⇒ any non-flat position is anomalous).
+    ///   3. Call [`CircuitBreakers::check_position_anomaly`]; on
+    ///      `Anomalous`, build a [`FlattenRequest`] (side opposite of
+    ///      the existing position, quantity = `|current_position|`) and
+    ///      `try_send` it on `flatten_tx`.
+    ///   4. On `try_send` returning `Full`, emit a `tracing::warn!` and
+    ///      journal a [`SystemEventRecord`] with
+    ///      `category = "flatten_request_dropped"`. Never panics, never
+    ///      blocks.
+    ///
+    /// `journal` is the `JournalSender` used to record dropped flatten
+    /// requests; pass the same handle the rest of the engine uses so the
+    /// audit trail is unified.
+    ///
+    /// The matching `Receiver<FlattenRequest>` and the async
+    /// `handle_anomaly` consumer task are NOT owned by this commit —
+    /// Story 8.2 will install them on the broker runtime.
+    pub fn attach_anomaly_detection(
+        &mut self,
+        tracker: Arc<PositionTracker>,
+        expected: Box<dyn ExpectedPositionSource>,
+        sender: mpsc::Sender<FlattenRequest>,
+        journal: JournalSender,
+    ) {
+        debug_assert!(
+            self.flatten_tx.is_none(),
+            "attach_anomaly_detection called twice — prior wires would be silently dropped"
+        );
+        if expected.is_empty_default() {
+            tracing::warn!(
+                "attach_anomaly_detection: using EmptyExpectedPositions default — every held position will be flagged anomalous; intended for tests/Epic-6-seam only"
+            );
+        }
+        self.position_tracker = Some(tracker);
+        self.expected_positions = Some(expected);
+        self.flatten_tx = Some(sender);
+        self.anomaly_journal = Some(journal);
     }
 
     /// Read access to the wired-in circuit-breaker framework, when present.
@@ -252,6 +386,11 @@ impl<C: Clock> EventLoop<C> {
             );
         }
 
+        // Pre-Epic-6 cleanup D-2: per-tick anomaly check producer. Runs
+        // when all three seams are attached AND a CircuitBreakers
+        // instance is wired in (anomaly state lives there).
+        self.check_anomalies_and_publish();
+
         // Periodic stale check (every N iterations) to detect silence
         if self.tick_count.is_multiple_of(STALE_CHECK_INTERVAL) {
             let now = self.clock.now().as_nanos();
@@ -276,6 +415,132 @@ impl<C: Clock> EventLoop<C> {
         }
 
         state
+    }
+
+    /// Pre-Epic-6 cleanup D-2: per-tick anomaly-detection producer
+    /// implementation. Iterates the attached `PositionTracker` snapshot,
+    /// calls `check_position_anomaly`, and `try_send`s `FlattenRequest`
+    /// on trip. Full-channel case logs warn + journals
+    /// `flatten_request_dropped`; never blocks or panics.
+    ///
+    /// No-op when any of the four seams (tracker / expected /
+    /// flatten_tx / breakers) is missing — keeps existing tests that
+    /// only attach `CircuitBreakers` from changing semantics.
+    fn check_anomalies_and_publish(&mut self) {
+        // All four wires must be present for the producer to run.
+        let (Some(tracker), Some(expected), Some(sender), Some(breakers)) = (
+            self.position_tracker.as_ref(),
+            self.expected_positions.as_ref(),
+            self.flatten_tx.as_ref(),
+            self.breakers.as_mut(),
+        ) else {
+            return;
+        };
+
+        let now_ts = self.clock.now();
+
+        // Snapshot iter: PositionTracker::iter yields (&u32, &Position)
+        // for every tracked symbol (flat-and-pruned entries are already
+        // dropped). We materialize symbol_id + signed-position pairs into
+        // a Vec to release the borrow on `tracker` before the
+        // `breakers.check_position_anomaly` mutable borrow.
+        let snapshot: Vec<(u32, i32)> = tracker
+            .iter()
+            .filter_map(|(symbol_id, pos)| {
+                let signed = signed_position(pos);
+                if signed == 0 {
+                    None
+                } else {
+                    Some((*symbol_id, signed))
+                }
+            })
+            .collect();
+
+        for (symbol_id, current_position) in snapshot {
+            let strategy_expected = expected.expected_position(symbol_id);
+            let outcome = breakers.check_position_anomaly(
+                symbol_id,
+                current_position,
+                strategy_expected,
+                now_ts,
+            );
+            if let AnomalyCheckOutcome::Anomalous {
+                current_position: cur, ..
+            } = outcome
+            {
+                // Build flatten request: side opposite of existing
+                // position; quantity = |current_position|. Saturate
+                // negative-i32 clamp before `unsigned_abs` is fine.
+                let qty: u32 = cur.unsigned_abs();
+                if qty == 0 {
+                    // Defensive: anomaly with zero qty shouldn't happen
+                    // but skip rather than emit a 0-qty flatten.
+                    continue;
+                }
+                let flatten_side = if cur > 0 { Side::Sell } else { Side::Buy };
+                let req = FlattenRequest {
+                    // 0 is a sentinel meaning "consumer side allocates".
+                    // Story 8.2's consumer is responsible for assigning a
+                    // unique engine-side order_id before submission.
+                    order_id: 0,
+                    symbol_id,
+                    side: flatten_side,
+                    quantity: qty,
+                    decision_id: 0,
+                    timestamp: now_ts,
+                };
+                match sender.try_send(req) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!(
+                            target: "event_loop",
+                            symbol_id,
+                            current_position = cur,
+                            strategy_expected,
+                            "FlattenRequest channel full — request dropped, journaling"
+                        );
+                        if let Some(journal) = self.anomaly_journal.as_ref() {
+                            let rec = SystemEventRecord {
+                                timestamp: now_ts,
+                                category: "flatten_request_dropped".to_string(),
+                                message: format!(
+                                    "anomaly detected on symbol {symbol_id} \
+                                     (current={cur}, expected={strategy_expected}) \
+                                     but flatten channel full — request dropped"
+                                ),
+                            };
+                            if !journal.send(JournalEvent::SystemEvent(rec)) {
+                                tracing::error!(target = "audit_loss", category = "flatten_request_dropped", "journal queue full — audit record lost");
+                            }
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!(
+                            target: "event_loop",
+                            symbol_id,
+                            "FlattenRequest channel closed — consumer task gone"
+                        );
+                        if let Some(journal) = self.anomaly_journal.as_ref() {
+                            let rec = SystemEventRecord {
+                                timestamp: now_ts,
+                                category: "flatten_request_dropped".to_string(),
+                                message: format!(
+                                    "anomaly detected on symbol {symbol_id} \
+                                     (current={cur}, expected={strategy_expected}) \
+                                     but flatten channel closed — request dropped"
+                                ),
+                            };
+                            if !journal.send(JournalEvent::SystemEvent(rec)) {
+                                tracing::error!(target = "audit_loss", category = "flatten_request_dropped", "journal queue full — audit record lost");
+                            }
+                        }
+                        self.flatten_tx = None;
+                        tracing::warn!("FlattenRequest channel closed — anomaly producer disabled until reattached");
+                        break; // stop iterating positions; no consumer to receive any more
+                    }
+                }
+            }
+        }
     }
 
     /// Tick-time fee-staleness check. Story 5.4 task 6.3 says this should
@@ -574,6 +839,10 @@ mod tests {
     use futures_bmad_core::{BreakerState, BreakerType, TradingConfig};
 
     fn breakers_for_test() -> CircuitBreakers {
+        use std::sync::Arc;
+        use crate::persistence::journal::EventJournal;
+        use crate::risk::panic_mode::PanicMode;
+
         let cfg = TradingConfig {
             symbol: "ES".into(),
             max_position_size: 2,
@@ -588,7 +857,9 @@ mod tests {
             events: Vec::new(),
         };
         let (tx, _rx) = unbounded();
-        CircuitBreakers::new(&cfg, tx)
+        let (ptx, _prx) = EventJournal::channel();
+        let panic_mode = Arc::new(PanicMode::new(ptx));
+        CircuitBreakers::new(&cfg, tx, panic_mode)
     }
 
     #[test]
@@ -674,5 +945,243 @@ mod tests {
         }
         ev.tick();
         assert!(ev.breakers().is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Pre-Epic-6 cleanup D-2 — anomaly producer wiring tests.
+    //
+    // These cover the new `attach_anomaly_detection` seam: when all four
+    // wires are present, a non-flat PositionTracker entry that diverges
+    // from the strategy-expected position trips the AnomalousPosition
+    // breaker AND publishes a FlattenRequest on the channel.
+    // -------------------------------------------------------------------
+
+    use crate::order_manager::tracker::PositionTracker;
+    use crate::persistence::journal::{
+        EngineEvent as TestJournalEvent, EventJournal,
+    };
+    use futures_bmad_core::FillType;
+
+    fn fill_buy(qty: u32) -> futures_bmad_core::FillEvent {
+        futures_bmad_core::FillEvent {
+            order_id: 1,
+            fill_price: FixedPrice::new(18000),
+            fill_size: qty,
+            timestamp: UnixNanos::new(1),
+            side: Side::Buy,
+            decision_id: 1,
+            fill_type: FillType::Full,
+        }
+    }
+
+    /// D-2 acceptance: divergence between PositionTracker and
+    /// ExpectedPositionSource trips the AnomalousPosition breaker AND
+    /// publishes a FlattenRequest on the channel.
+    #[test]
+    fn anomaly_divergence_trips_and_publishes_flatten_request() {
+        let (_producer, consumer) = market_event_queue(16);
+        let clock = SimClock::new(BASE_TS);
+        let mut ev = EventLoop::new(consumer, clock, 3.0);
+        ev.attach_circuit_breakers(breakers_for_test(), FixedPrice::new(4));
+
+        // Build a PositionTracker holding a long-3 position on symbol 1.
+        let (jtx, _jrx) = EventJournal::channel();
+        let mut tracker = PositionTracker::new(jtx.clone());
+        tracker.apply_fill(&fill_buy(3), 1);
+        let tracker = Arc::new(tracker);
+
+        // EmptyExpectedPositions: any non-flat position is anomalous.
+        let expected: Box<dyn ExpectedPositionSource> = Box::new(EmptyExpectedPositions);
+        let (flatten_tx, mut flatten_rx) = mpsc::channel::<FlattenRequest>(8);
+        ev.attach_anomaly_detection(tracker, expected, flatten_tx, jtx);
+
+        ev.tick();
+
+        // Breaker tripped.
+        let breakers = ev.breakers().unwrap();
+        assert_eq!(
+            breakers.state(BreakerType::AnomalousPosition),
+            BreakerState::Tripped,
+            "AnomalousPosition breaker must trip on divergence"
+        );
+
+        // FlattenRequest published.
+        let req = flatten_rx
+            .try_recv()
+            .expect("flatten request must be on channel");
+        assert_eq!(req.symbol_id, 1);
+        assert_eq!(req.side, Side::Sell, "flatten side opposite of long");
+        assert_eq!(req.quantity, 3);
+    }
+
+    /// D-2 negative: when tracker is consistent (flat AND expected flat),
+    /// no FlattenRequest is published.
+    #[test]
+    fn anomaly_no_divergence_publishes_nothing() {
+        let (_producer, consumer) = market_event_queue(16);
+        let clock = SimClock::new(BASE_TS);
+        let mut ev = EventLoop::new(consumer, clock, 3.0);
+        ev.attach_circuit_breakers(breakers_for_test(), FixedPrice::new(4));
+
+        // Empty PositionTracker — no positions at all.
+        let (jtx, _jrx) = EventJournal::channel();
+        let tracker = Arc::new(PositionTracker::new(jtx.clone()));
+        let expected: Box<dyn ExpectedPositionSource> = Box::new(EmptyExpectedPositions);
+        let (flatten_tx, mut flatten_rx) = mpsc::channel::<FlattenRequest>(8);
+        ev.attach_anomaly_detection(tracker, expected, flatten_tx, jtx);
+
+        ev.tick();
+
+        let breakers = ev.breakers().unwrap();
+        assert_eq!(
+            breakers.state(BreakerType::AnomalousPosition),
+            BreakerState::Active
+        );
+        assert!(flatten_rx.try_recv().is_err());
+    }
+
+    /// D-2: when the strategy explicitly claims the position
+    /// (`ExpectedPositionSource` matches the tracker), no anomaly trips.
+    #[test]
+    fn anomaly_strategy_claim_matches_tracker_no_trip() {
+        struct MatchingExpected;
+        impl ExpectedPositionSource for MatchingExpected {
+            fn expected_position(&self, symbol_id: u32) -> i32 {
+                if symbol_id == 1 { 3 } else { 0 }
+            }
+        }
+
+        let (_producer, consumer) = market_event_queue(16);
+        let clock = SimClock::new(BASE_TS);
+        let mut ev = EventLoop::new(consumer, clock, 3.0);
+        ev.attach_circuit_breakers(breakers_for_test(), FixedPrice::new(4));
+
+        let (jtx, _jrx) = EventJournal::channel();
+        let mut tracker = PositionTracker::new(jtx.clone());
+        tracker.apply_fill(&fill_buy(3), 1);
+        let tracker = Arc::new(tracker);
+
+        let expected: Box<dyn ExpectedPositionSource> = Box::new(MatchingExpected);
+        let (flatten_tx, mut flatten_rx) = mpsc::channel::<FlattenRequest>(8);
+        ev.attach_anomaly_detection(tracker, expected, flatten_tx, jtx);
+
+        ev.tick();
+
+        let breakers = ev.breakers().unwrap();
+        assert_eq!(
+            breakers.state(BreakerType::AnomalousPosition),
+            BreakerState::Active,
+            "strategy-claimed position must NOT trigger anomaly"
+        );
+        assert!(flatten_rx.try_recv().is_err());
+    }
+
+    /// D-2 acceptance: when the FlattenRequest channel is full, the
+    /// producer logs warn and journals a `flatten_request_dropped`
+    /// SystemEventRecord WITHOUT panicking or blocking.
+    #[test]
+    fn anomaly_full_channel_logs_and_journals_no_panic() {
+        let (_producer, consumer) = market_event_queue(16);
+        let clock = SimClock::new(BASE_TS);
+        let mut ev = EventLoop::new(consumer, clock, 3.0);
+        ev.attach_circuit_breakers(breakers_for_test(), FixedPrice::new(4));
+
+        let (jtx, jrx) = EventJournal::channel();
+        let mut tracker = PositionTracker::new(jtx.clone());
+        tracker.apply_fill(&fill_buy(3), 1);
+        let tracker = Arc::new(tracker);
+
+        let expected: Box<dyn ExpectedPositionSource> = Box::new(EmptyExpectedPositions);
+        // Capacity 1 channel — fill it up first so the next try_send
+        // returns Full.
+        let (flatten_tx, _flatten_rx) = mpsc::channel::<FlattenRequest>(1);
+        flatten_tx
+            .try_send(FlattenRequest {
+                order_id: 0,
+                symbol_id: 99,
+                side: Side::Buy,
+                quantity: 1,
+                decision_id: 0,
+                timestamp: UnixNanos::new(0),
+            })
+            .expect("priming send must succeed");
+
+        ev.attach_anomaly_detection(tracker, expected, flatten_tx, jtx);
+
+        // Must not panic.
+        ev.tick();
+
+        // Drain the journal looking for the dropped marker.
+        let mut found = false;
+        for _ in 0..16 {
+            match jrx.try_recv_for_test() {
+                Some(TestJournalEvent::SystemEvent(rec))
+                    if rec.category == "flatten_request_dropped" =>
+                {
+                    found = true;
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        assert!(
+            found,
+            "expected SystemEventRecord with category=flatten_request_dropped"
+        );
+    }
+
+    /// Patch 1: `signed_position` saturates at `i32::MAX` rather than
+    /// silently sign-flipping when a corrupt `Position::quantity = u32::MAX`
+    /// is fed in.
+    #[test]
+    fn signed_position_saturates_at_i32_max_for_corrupt_quantity() {
+        use futures_bmad_core::Position;
+
+        let long = Position {
+            symbol_id: 1,
+            side: Some(Side::Buy),
+            quantity: u32::MAX,
+            avg_entry_price: FixedPrice::default(),
+            unrealized_pnl: 0,
+            realized_pnl: 0,
+        };
+        assert_eq!(
+            signed_position(&long),
+            i32::MAX,
+            "long-side u32::MAX must saturate to i32::MAX, not negative wrap"
+        );
+
+        let short = Position {
+            symbol_id: 1,
+            side: Some(Side::Sell),
+            quantity: u32::MAX,
+            avg_entry_price: FixedPrice::default(),
+            unrealized_pnl: 0,
+            realized_pnl: 0,
+        };
+        assert_eq!(
+            signed_position(&short),
+            -i32::MAX,
+            "short-side u32::MAX must saturate to -i32::MAX, not positive wrap"
+        );
+    }
+
+    /// D-2: when none of the four anomaly wires are attached, the
+    /// existing tick path is unchanged (no panic, no surprising
+    /// AnomalousPosition trips).
+    #[test]
+    fn anomaly_unattached_no_op_path_preserved() {
+        let (_producer, consumer) = market_event_queue(16);
+        let clock = SimClock::new(BASE_TS);
+        let mut ev = EventLoop::new(consumer, clock, 3.0);
+        ev.attach_circuit_breakers(breakers_for_test(), FixedPrice::new(4));
+
+        // No `attach_anomaly_detection` call.
+        ev.tick();
+        assert_eq!(
+            ev.breakers().unwrap().state(BreakerType::AnomalousPosition),
+            BreakerState::Active
+        );
     }
 }

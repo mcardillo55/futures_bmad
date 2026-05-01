@@ -44,6 +44,12 @@ pub use alerting::{
     SharedAlertSender, alert_channel,
 };
 pub use anomaly_handler::{AnomalyResolution, handle_anomaly};
+// Re-export the broker-side `FlattenRequest` so producers (Story 5.3
+// pre-Epic-6 cleanup, in `EventLoop`) and consumers (Story 8.2) share a
+// single import path. The struct itself remains owned by
+// `futures_bmad_broker::position_flatten` — re-exporting keeps the seam
+// stable across crate boundaries.
+pub use futures_bmad_broker::FlattenRequest;
 pub use circuit_breakers::{AnomalyCheckOutcome, CircuitBreakers, ConnectionState};
 pub use event_windows::{ActiveEvent, EventWindowManager, TradingRestriction};
 pub use fee_gate::{FeeGate, FeeGateReason};
@@ -61,6 +67,13 @@ pub use panic_mode::{ActivationOutcome, OrderCancellation, PanicContext, PanicMo
 /// — the happy-path `permits_trading()` short-circuits to `Ok(())`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DenialReason {
+    /// Panic mode is active — trading is disabled until process restart. This
+    /// variant has NO 1:1 [`BreakerType`] mapping (panic mode lives outside
+    /// the breaker table) and is always reported FIRST in
+    /// [`TradingDenied::reasons`] when present so operator alerts attribute
+    /// the denial to panic mode rather than secondary breaker triggers panic
+    /// mode's flatten path likely caused.
+    PanicModeActive,
     /// Daily-loss breaker tripped — session P&L hit the configured cap.
     DailyLossExceeded { current: i64, limit: i64 },
     /// Consecutive-losses breaker tripped.
@@ -84,19 +97,24 @@ pub enum DenialReason {
 }
 
 impl DenialReason {
-    /// The breaker/gate type this denial corresponds to.
-    pub const fn breaker_type(&self) -> BreakerType {
+    /// The breaker/gate type this denial corresponds to, if any.
+    ///
+    /// [`DenialReason::PanicModeActive`] returns `None` — panic mode is
+    /// orthogonal to the breaker table (it lives in
+    /// [`crate::risk::panic_mode`]).
+    pub const fn breaker_type(&self) -> Option<BreakerType> {
         match self {
-            DenialReason::DailyLossExceeded { .. } => BreakerType::DailyLoss,
-            DenialReason::ConsecutiveLossesExceeded { .. } => BreakerType::ConsecutiveLosses,
-            DenialReason::MaxTradesExceeded { .. } => BreakerType::MaxTrades,
-            DenialReason::AnomalousPosition { .. } => BreakerType::AnomalousPosition,
-            DenialReason::ConnectionFailure { .. } => BreakerType::ConnectionFailure,
-            DenialReason::BufferOverflow { .. } => BreakerType::BufferOverflow,
-            DenialReason::MaxPositionSizeExceeded { .. } => BreakerType::MaxPositionSize,
-            DenialReason::DataQualityFailure { .. } => BreakerType::DataQuality,
-            DenialReason::FeeScheduleStale { .. } => BreakerType::FeeStaleness,
-            DenialReason::MalformedMessages { .. } => BreakerType::MalformedMessages,
+            DenialReason::PanicModeActive => None,
+            DenialReason::DailyLossExceeded { .. } => Some(BreakerType::DailyLoss),
+            DenialReason::ConsecutiveLossesExceeded { .. } => Some(BreakerType::ConsecutiveLosses),
+            DenialReason::MaxTradesExceeded { .. } => Some(BreakerType::MaxTrades),
+            DenialReason::AnomalousPosition { .. } => Some(BreakerType::AnomalousPosition),
+            DenialReason::ConnectionFailure { .. } => Some(BreakerType::ConnectionFailure),
+            DenialReason::BufferOverflow { .. } => Some(BreakerType::BufferOverflow),
+            DenialReason::MaxPositionSizeExceeded { .. } => Some(BreakerType::MaxPositionSize),
+            DenialReason::DataQualityFailure { .. } => Some(BreakerType::DataQuality),
+            DenialReason::FeeScheduleStale { .. } => Some(BreakerType::FeeStaleness),
+            DenialReason::MalformedMessages { .. } => Some(BreakerType::MalformedMessages),
         }
     }
 }
@@ -104,6 +122,9 @@ impl DenialReason {
 impl fmt::Display for DenialReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DenialReason::PanicModeActive => {
+                write!(f, "panic mode active — manual restart required")
+            }
             DenialReason::DailyLossExceeded { current, limit } => {
                 write!(f, "daily loss {current} ticks reached limit {limit}")
             }
@@ -162,7 +183,16 @@ impl TradingDenied {
 
     /// Whether a denial of the given type is present in this set.
     pub fn contains(&self, ty: BreakerType) -> bool {
-        self.reasons.iter().any(|r| r.breaker_type() == ty)
+        self.reasons.iter().any(|r| r.breaker_type() == Some(ty))
+    }
+
+    /// Whether the panic-mode denial is present in this set. Convenience
+    /// helper because [`DenialReason::PanicModeActive`] has no
+    /// [`BreakerType`] (so it can't be queried via [`Self::contains`]).
+    pub fn contains_panic_mode(&self) -> bool {
+        self.reasons
+            .iter()
+            .any(|r| matches!(r, DenialReason::PanicModeActive))
     }
 }
 
@@ -243,7 +273,40 @@ mod tests {
             ),
         ];
         for (reason, expected_type) in pairs {
-            assert_eq!(reason.breaker_type(), expected_type);
+            assert_eq!(reason.breaker_type(), Some(expected_type));
+        }
+    }
+
+    #[test]
+    fn panic_mode_active_has_no_breaker_type() {
+        assert_eq!(DenialReason::PanicModeActive.breaker_type(), None);
+    }
+
+    #[test]
+    fn panic_mode_active_display_is_descriptive() {
+        let s = format!("{}", DenialReason::PanicModeActive);
+        assert!(s.contains("panic mode"));
+    }
+
+    #[test]
+    fn trading_denied_contains_panic_mode_only_via_helper() {
+        let denied = TradingDenied::from_reasons([DenialReason::PanicModeActive]);
+        assert!(denied.contains_panic_mode());
+        // Default `contains` is keyed on BreakerType — panic mode has no
+        // mapping, so every BreakerType query returns false.
+        for bt in [
+            BreakerType::DailyLoss,
+            BreakerType::ConsecutiveLosses,
+            BreakerType::MaxTrades,
+            BreakerType::AnomalousPosition,
+            BreakerType::ConnectionFailure,
+            BreakerType::BufferOverflow,
+            BreakerType::MaxPositionSize,
+            BreakerType::DataQuality,
+            BreakerType::FeeStaleness,
+            BreakerType::MalformedMessages,
+        ] {
+            assert!(!denied.contains(bt));
         }
     }
 

@@ -1,4 +1,4 @@
-//! Story 5.3 Task 4: anomaly -> flatten -> panic orchestration.
+//! Story 5.3 Task 4 + pre-Epic-6 cleanup D-2: anomaly → flatten → panic orchestration.
 //!
 //! The synchronous event loop (engine/src/event_loop.rs) detects an anomalous
 //! position via [`CircuitBreakers::check_position_anomaly`] and emits an
@@ -8,21 +8,54 @@
 //! awaits between attempts. This module bridges those two worlds:
 //!
 //! ```text
-//!     event_loop (sync)              broker runtime (async)
-//!     ────────────────                ──────────────────────
-//!     check_position_anomaly  ──►  spawn handle_anomaly(...)  ──►
-//!                                       PositionFlattener::flatten
-//!                                       │                       │
-//!                                  Ok(())                Err(AllAttemptsFailed)
-//!                                       │                       │
-//!                                       ▼                       ▼
-//!                                 log resolution           PanicMode::activate_with_context
-//!                                 (breaker stays tripped)
+//!     event_loop (sync)                   tokio::sync::mpsc           broker runtime (async)
+//!     ─────────────────                   ───────────────────         ──────────────────────
+//!     check_position_anomaly  ──►  flatten_tx.try_send(req)   ──►   recv()
+//!                                                                       │
+//!                                                                       ▼
+//!                                                              spawn handle_anomaly(...)
+//!                                                                       │
+//!                                                                  PositionFlattener::flatten
+//!                                                                       │                       │
+//!                                                                  Ok(())                Err(AllAttemptsFailed)
+//!                                                                       │                       │
+//!                                                                       ▼                       ▼
+//!                                                                 log resolution           PanicMode::activate_with_context
+//!                                                                 (breaker stays tripped)
 //! ```
 //!
-//! Critical contract:
-//! - `handle_anomaly` is `async` and is intended to be `tokio::spawn`-ed onto
-//!   the broker runtime; the engine hot path NEVER awaits the flatten result.
+//! ## Producer / consumer split
+//!
+//! As of the pre-Epic-6 cleanup commit (D-2), the producer side of this
+//! pipeline is wired:
+//!
+//! - **Producer (this commit, in [`crate::event_loop::EventLoop`]):** every
+//!   tick iterates the attached `PositionTracker` snapshot, calls
+//!   [`crate::risk::CircuitBreakers::check_position_anomaly`], and
+//!   `try_send`s a [`futures_bmad_broker::FlattenRequest`] on the
+//!   per-loop `tokio::sync::mpsc::Sender<FlattenRequest>`. On a full
+//!   channel the producer logs `warn!` and journals a
+//!   `SystemEventRecord { category: "flatten_request_dropped", .. }`; it
+//!   never blocks or panics.
+//!
+//! - **Consumer (Story 8.2, NOT this commit):** an async task on the
+//!   broker runtime owns the matching `Receiver<FlattenRequest>`,
+//!   `.await recv()`s, and `tokio::spawn`s [`handle_anomaly`] for each
+//!   request.
+//!
+//! The split keeps the engine event loop synchronous (no `.await`, no
+//! Tokio runtime introduction) while deferring the consumer-side
+//! ownership decisions (which broker runtime, panic-mode arc-sharing,
+//! cancellation strategy) to Story 8.2.
+//!
+//! ## Critical contract
+//!
+//! - [`handle_anomaly`] is `async` and is intended to be `tokio::spawn`-ed onto
+//!   the broker runtime by the (future) consumer task; the engine hot path
+//!   NEVER awaits the flatten result.
+//! - [`futures_bmad_broker::FlattenRequest`] is `Copy + Send + 'static`
+//!   (every field is a `u32`/`u64`/enum). It is therefore safe to publish
+//!   across the producer→consumer boundary without additional cloning.
 //! - The `AnomalousPosition` breaker remains tripped on flatten success —
 //!   per AC, anomalous-position is a manual-reset event even when the
 //!   automated flatten resolves the position. The fact that we recovered

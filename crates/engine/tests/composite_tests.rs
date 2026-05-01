@@ -122,49 +122,35 @@ fn fee_gate_round_trip_cost() {
 
 #[test]
 fn fee_gate_permits_when_edge_exceeds_threshold() {
-    let clock = sim_clock();
     let gate = default_fee_gate();
     // threshold = 2.0 * 10 = 20 qt -> edge must be > 20
     let edge = FixedPrice::new(21);
-    assert_eq!(gate.permits_trade(edge, &clock), Ok(true));
+    assert_eq!(gate.permits_trade(edge), Ok(true));
 }
 
 #[test]
 fn fee_gate_blocks_when_edge_below_threshold() {
-    let clock = sim_clock();
     let gate = default_fee_gate();
     // threshold = 20, edge = 19
     let edge = FixedPrice::new(19);
-    assert_eq!(gate.permits_trade(edge, &clock), Ok(false));
+    assert_eq!(gate.permits_trade(edge), Ok(false));
 }
 
+/// Pre-Epic-6 cleanup D-3: `FeeGate::permits_trade` no longer consults
+/// fee-schedule staleness. The 31-day warn moved to
+/// `CircuitBreakers::check_fee_staleness`; the 61-day gate is owned by
+/// the same. `permits_trade` is now pure economics (edge vs fee).
 #[test]
-fn fee_gate_staleness_warn_at_31_days() {
-    let clock = sim_clock();
-    let mut gate = default_fee_gate();
-    // Set date to 31 days ago
-    let today = clock.wall_clock().date_naive();
-    gate.fee_schedule_date = today - chrono::Duration::days(31);
-
-    // Should still permit (warns but doesn't block)
-    let edge = FixedPrice::new(21);
-    assert_eq!(gate.permits_trade(edge, &clock), Ok(true));
-}
-
-#[test]
-fn fee_gate_staleness_blocks_at_61_days() {
+fn fee_gate_staleness_no_longer_blocks_at_61_days() {
     let clock = sim_clock();
     let mut gate = default_fee_gate();
     let today = clock.wall_clock().date_naive();
     gate.fee_schedule_date = today - chrono::Duration::days(61);
 
+    // Edge well above the threshold — staleness has no effect; trade is
+    // permitted on pure economics.
     let edge = FixedPrice::new(100);
-    match gate.permits_trade(edge, &clock) {
-        Err(futures_bmad_engine::risk::FeeGateReason::StaleSchedule { days }) => {
-            assert!(days >= 61);
-        }
-        other => panic!("expected StaleSchedule, got {other:?}"),
-    }
+    assert_eq!(gate.permits_trade(edge), Ok(true));
 }
 
 #[test]
@@ -278,7 +264,15 @@ fn evaluate_direction_from_positive_score() {
 }
 
 #[test]
-fn evaluate_stale_fee_gate_blocks_trade() {
+/// Pre-Epic-6 cleanup D-3: a stale fee schedule no longer blocks trades
+/// at the `FeeGate::permits_trade` layer — the responsibility moved to
+/// `CircuitBreakers::check_fee_staleness` / `permits_trade_evaluation`.
+/// `CompositeEvaluator` now permits trades through the fee gate on edge
+/// alone; staleness is enforced upstream.
+///
+/// This test confirms the new behaviour: with a 61-day-stale schedule
+/// AND sufficient edge, the evaluator returns `Trade`.
+fn evaluate_stale_fee_gate_does_not_block_trade_after_d3() {
     let clock = sim_clock();
     let mut pipeline = SignalPipeline::new(1, FixedPrice::new(MAX_SPREAD), 10, 2);
     warm_pipeline(&mut pipeline, &clock);
@@ -296,7 +290,11 @@ fn evaluate_stale_fee_gate_blocks_trade() {
 
     let mut evaluator = CompositeEvaluator::new(config);
     let decision = evaluator.evaluate(&pipeline, &fee_gate, &clock);
-    assert_eq!(decision.reason, DecisionReason::NoTradeFeeGateBlocked);
+    assert_eq!(
+        decision.reason,
+        DecisionReason::Trade,
+        "fee staleness must NOT block trades at the FeeGate layer post-D-3"
+    );
 }
 
 #[test]

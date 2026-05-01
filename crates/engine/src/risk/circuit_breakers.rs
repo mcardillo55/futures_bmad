@@ -35,6 +35,7 @@
 #![deny(unsafe_code)]
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::NaiveDate;
@@ -46,6 +47,7 @@ use futures_bmad_core::{
 use tracing::{error, info, warn};
 
 use super::alerting::{Alert, AlertSender, PositionSnapshot};
+use super::panic_mode::PanicMode;
 use super::{DenialReason, TradingDenied};
 
 /// Reconnection FSM state surfaced by `engine/src/connection/fsm.rs`.
@@ -95,6 +97,12 @@ const BUFFER_FULL_PCT: f32 = 100.0;
 /// Fee schedule staleness threshold (days). Anything strictly greater than
 /// this trips the fee-staleness gate.
 const FEE_STALENESS_DAYS: i64 = 60;
+
+/// Fee schedule staleness warn threshold (days). Anything strictly greater
+/// than this but less than [`FEE_STALENESS_DAYS`] emits a `tracing::warn!`
+/// from [`CircuitBreakers::check_fee_staleness`] without tripping the gate.
+/// Pre-Epic-6 cleanup D-3: relocated from `FeeGate::permits_trade`.
+const FEE_STALENESS_WARN_DAYS: i64 = 30;
 
 /// Per-state tracking for the ten breakers / gates.
 ///
@@ -168,6 +176,17 @@ pub struct CircuitBreakers {
     /// severity `Error`. Gates explicitly do NOT route through this path —
     /// gate transitions remain routine structured-log events.
     alerts: Option<AlertSender>,
+
+    /// Panic-mode controller (D-1 fix from pre-Epic-6 cleanup spec).
+    /// `permits_trading` and `permits_trade_evaluation` consult this FIRST;
+    /// when `is_trading_enabled()` returns `false`,
+    /// [`DenialReason::PanicModeActive`] is prepended to the returned
+    /// `reasons` list so operator alerts attribute the denial to panic mode
+    /// rather than secondary breakers panic mode's flatten path likely
+    /// caused. Held as an `Arc` so the same controller can be shared with
+    /// the (future) consumer task that drives `handle_anomaly` in Story
+    /// 8.2.
+    panic_mode: Arc<PanicMode>,
 }
 
 impl CircuitBreakers {
@@ -175,7 +194,17 @@ impl CircuitBreakers {
     /// `Active` (i.e. not tripped). `journal` is the crossbeam sender used
     /// to emit `CircuitBreakerEvent` records on every trip / clear; the
     /// receiver lives on the journal worker thread (see `persistence`).
-    pub fn new(config: &TradingConfig, journal: Sender<CircuitBreakerEvent>) -> Self {
+    ///
+    /// `panic_mode` is the shared [`PanicMode`] controller. When the
+    /// controller's `is_trading_enabled()` returns `false`,
+    /// [`Self::permits_trading`] / [`Self::permits_trade_evaluation`]
+    /// short-circuit with [`DenialReason::PanicModeActive`] as the FIRST
+    /// reason. Pass an `Arc::new(PanicMode::new(journal_clone))` here.
+    pub fn new(
+        config: &TradingConfig,
+        journal: Sender<CircuitBreakerEvent>,
+        panic_mode: Arc<PanicMode>,
+    ) -> Self {
         Self {
             daily_loss_state: BreakerState::Active,
             consecutive_losses_state: BreakerState::Active,
@@ -214,6 +243,7 @@ impl CircuitBreakers {
 
             journal,
             alerts: None,
+            panic_mode,
         }
     }
 
@@ -226,6 +256,13 @@ impl CircuitBreakers {
         self
     }
 
+    /// Read access to the shared [`PanicMode`] controller. Used by
+    /// integrators (engine event loop, future Story 8.2 anomaly consumer)
+    /// that need to share the same controller without re-constructing.
+    pub fn panic_mode(&self) -> &Arc<PanicMode> {
+        &self.panic_mode
+    }
+
     /// All breakers green ⇒ `Ok(())` without allocation. Otherwise returns
     /// the full set of denial reasons.
     ///
@@ -234,17 +271,35 @@ impl CircuitBreakers {
     /// is the gate safety / flatten orders go through, so a stale fee
     /// schedule never blocks a stop-loss or panic-mode flatten.
     ///
+    /// **Panic-mode precedence (D-1):** the panic-mode controller is
+    /// consulted FIRST. When `panic_mode.is_trading_enabled() == false`,
+    /// the call returns `Err` with [`DenialReason::PanicModeActive`] as
+    /// `reasons[0]` even if every breaker is otherwise `Active`. This
+    /// ensures operator alerts attribute the denial to panic mode rather
+    /// than to secondary breakers that panic mode's flatten path likely
+    /// caused.
+    ///
     /// `#[inline]` because this sits on the per-tick hot path and the
     /// happy path collapses to a single boolean reduction over nine
     /// `BreakerState::Active` checks.
+    ///
+    /// Single-snapshot consultation of panic_mode — TOCTOU-safe within a call.
     #[inline]
     pub fn permits_trading(&self) -> Result<(), TradingDenied> {
+        // D-1: panic-mode first. The atomic load is single-instruction
+        // hot-path-clean; on the happy path (panic inactive) we fall
+        // through to the breaker reduction unchanged.
+        let panic_active = !self.panic_mode.is_trading_enabled();
         // Happy-path early-out: bitwise reduction over nine enum equalities,
         // no allocation, no branching beyond the AND chain.
-        if self.all_active_excluding_eval_only() {
+        if !panic_active && self.all_active_excluding_eval_only() {
             return Ok(());
         }
-        Err(self.collect_denials_excluding_eval_only())
+        let mut denied = self.collect_denials_excluding_eval_only();
+        if panic_active {
+            denied.reasons.insert(0, DenialReason::PanicModeActive);
+        }
+        Err(denied)
     }
 
     /// Whether every non-eval-only breaker / gate is currently `Active`.
@@ -340,7 +395,7 @@ impl CircuitBreakers {
         let mut denied = self.collect_denials();
         denied
             .reasons
-            .retain(|r| r.breaker_type() != BreakerType::FeeStaleness);
+            .retain(|r| r.breaker_type() != Some(BreakerType::FeeStaleness));
         denied
     }
 
@@ -1053,10 +1108,22 @@ impl CircuitBreakers {
                     timestamp,
                 );
             }
-        } else if matches!(self.fee_staleness_state, BreakerState::Tripped) {
-            // Operator pushed a fresh config — auto-clear.
-            if let Err(e) = self.clear_gate(BreakerType::FeeStaleness, timestamp) {
-                warn!(target: "circuit_breakers", error = ?e, "fee_staleness clear_gate failed");
+        } else {
+            // Pre-Epic-6 cleanup D-3: the `>30 days` warn was relocated
+            // from `FeeGate::permits_trade` to here so the staleness
+            // surface lives in exactly one place.
+            if days_old > FEE_STALENESS_WARN_DAYS {
+                warn!(
+                    target: "circuit_breakers",
+                    days = days_old,
+                    "fee schedule >30 days stale (warning only; gate trips at >60)"
+                );
+            }
+            if matches!(self.fee_staleness_state, BreakerState::Tripped) {
+                // Operator pushed a fresh config — auto-clear.
+                if let Err(e) = self.clear_gate(BreakerType::FeeStaleness, timestamp) {
+                    warn!(target: "circuit_breakers", error = ?e, "fee_staleness clear_gate failed");
+                }
             }
         }
     }
@@ -1073,12 +1140,23 @@ impl CircuitBreakers {
     /// `#[inline]` because the entry-order decision pipeline is also
     /// hot-path; the happy-path short-circuits to `Ok(())` without
     /// allocation.
+    ///
+    /// **Panic-mode precedence (D-1):** like [`Self::permits_trading`],
+    /// this consults the panic-mode controller FIRST. When panic mode is
+    /// active, `reasons[0] == DenialReason::PanicModeActive`.
+    ///
+    /// Single-snapshot consultation of panic_mode — TOCTOU-safe within a call.
     #[inline]
     pub fn permits_trade_evaluation(&self) -> Result<(), TradingDenied> {
-        if self.all_active() {
+        let panic_active = !self.panic_mode.is_trading_enabled();
+        if !panic_active && self.all_active() {
             return Ok(());
         }
-        Err(self.collect_denials())
+        let mut denied = self.collect_denials();
+        if panic_active {
+            denied.reasons.insert(0, DenialReason::PanicModeActive);
+        }
+        Err(denied)
     }
 
     /// Record a malformed Rithmic message arrival.
@@ -1199,7 +1277,38 @@ mod tests {
 
     fn fixture() -> (CircuitBreakers, Receiver<CircuitBreakerEvent>) {
         let (tx, rx) = unbounded();
-        (CircuitBreakers::new(&test_config(), tx), rx)
+        let panic_mode = Arc::new(PanicMode::new(panic_journal()));
+        (CircuitBreakers::new(&test_config(), tx, panic_mode), rx)
+    }
+
+    /// Stand-alone panic-mode-only fixture for tests that need to
+    /// activate panic mode and observe the resulting denial path.
+    fn fixture_with_panic() -> (
+        CircuitBreakers,
+        Receiver<CircuitBreakerEvent>,
+        Arc<PanicMode>,
+    ) {
+        let (tx, rx) = unbounded();
+        let panic_mode = Arc::new(PanicMode::new(panic_journal()));
+        (
+            CircuitBreakers::new(&test_config(), tx, panic_mode.clone()),
+            rx,
+            panic_mode,
+        )
+    }
+
+    fn panic_journal() -> crate::persistence::journal::JournalSender {
+        let (tx, _rx) = crate::persistence::journal::EventJournal::channel();
+        tx
+    }
+
+    /// Mock cancellation used to drive `PanicMode::activate` from D-1 tests.
+    #[derive(Default)]
+    struct NoopCancel;
+    impl crate::risk::panic_mode::OrderCancellation for NoopCancel {
+        fn cancel_entries_and_limits(&mut self) -> usize {
+            0
+        }
     }
 
     /// Task 9.1 — `permits_trading` is `Ok` when every breaker / gate is `Active`.
@@ -1413,7 +1522,8 @@ mod tests {
         use super::super::alerting::alert_channel;
         let (tx, rx) = unbounded();
         let (alerts_tx, alerts_rx) = alert_channel();
-        let cb = CircuitBreakers::new(&test_config(), tx).with_alerts(alerts_tx);
+        let panic_mode = Arc::new(PanicMode::new(panic_journal()));
+        let cb = CircuitBreakers::new(&test_config(), tx, panic_mode).with_alerts(alerts_tx);
         (cb, rx, alerts_rx)
     }
 
@@ -1684,6 +1794,45 @@ mod tests {
         // Fresh config (today's date) — gate auto-clears.
         cb.check_fee_staleness(today, today, UnixNanos::new(2));
         assert_eq!(cb.state(BreakerType::FeeStaleness), BreakerState::Active);
+    }
+
+    /// D-3 (relocated from FeeGate): a 31-day-old fee schedule emits a
+    /// `tracing::warn!` from `check_fee_staleness` but DOES NOT trip the
+    /// gate. This test verifies the gate stays Active; the warn is
+    /// observed only via a tracing subscriber so we don't assert on it
+    /// directly.
+    #[test]
+    fn fee_staleness_warn_at_31_days_does_not_trip_gate() {
+        let (mut cb, _rx) = fixture();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let sched_31 = today - chrono::Duration::days(31);
+        cb.check_fee_staleness(sched_31, today, UnixNanos::new(1));
+        assert_eq!(
+            cb.state(BreakerType::FeeStaleness),
+            BreakerState::Active,
+            "31-day staleness must warn-only, never trip the gate"
+        );
+    }
+
+    /// D-3 (sole owner): `CircuitBreakers::check_fee_staleness` is now
+    /// the single source for the >60d trip — the duplicate branch in
+    /// `FeeGate::permits_trade` was removed in pre-Epic-6 cleanup.
+    /// Confirms the trip + the `permits_trade_evaluation` denial
+    /// continue to fire here.
+    #[test]
+    fn fee_staleness_sole_owner_after_d3() {
+        let (mut cb, _rx) = fixture();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let sched = today - chrono::Duration::days(70);
+        cb.check_fee_staleness(sched, today, UnixNanos::new(1));
+        assert_eq!(cb.state(BreakerType::FeeStaleness), BreakerState::Tripped);
+
+        // Trade evaluation denied with FeeStaleness reason.
+        let denied = cb.permits_trade_evaluation().unwrap_err();
+        assert!(denied.contains(BreakerType::FeeStaleness));
+
+        // Safety/flatten path — STILL permitted (FeeStaleness is eval-only).
+        assert!(cb.permits_trading().is_ok());
     }
 
     /// 7.7 — fee staleness gate does NOT block safety/flatten orders;
@@ -2216,7 +2365,8 @@ mod tests {
             fee_schedule_date: chrono::Utc::now().date_naive(),
             events: Vec::new(),
         };
-        let mut cb = CircuitBreakers::new(&config, tx);
+        let pm = Arc::new(PanicMode::new(panic_journal()));
+        let mut cb = CircuitBreakers::new(&config, tx, pm.clone());
 
         // Position size: 4 OK, 5 trips.
         assert!(cb.check_position_size(4, UnixNanos::new(1)).is_none());
@@ -2224,13 +2374,13 @@ mod tests {
 
         // Daily loss: -200 OK, -300 trips against the 250 cap.
         let (tx2, _rx2) = unbounded();
-        let mut cb2 = CircuitBreakers::new(&config, tx2);
+        let mut cb2 = CircuitBreakers::new(&config, tx2, pm.clone());
         assert!(cb2.update_daily_loss(-200, 0, UnixNanos::new(1)).is_none());
         assert!(cb2.update_daily_loss(-300, 0, UnixNanos::new(2)).is_some());
 
         // Consecutive losses: 6 not trip, 7 trips.
         let (tx3, _rx3) = unbounded();
-        let mut cb3 = CircuitBreakers::new(&config, tx3);
+        let mut cb3 = CircuitBreakers::new(&config, tx3, pm.clone());
         for i in 0..6 {
             assert!(
                 cb3.record_trade_result(false, UnixNanos::new(i as u64))
@@ -2241,7 +2391,7 @@ mod tests {
 
         // Max trades: 100 OK, 101 trips.
         let (tx4, _rx4) = unbounded();
-        let mut cb4 = CircuitBreakers::new(&config, tx4);
+        let mut cb4 = CircuitBreakers::new(&config, tx4, pm);
         for i in 0..100u32 {
             assert!(cb4.record_trade(UnixNanos::new(i as u64)).is_none());
         }
@@ -2361,5 +2511,71 @@ mod tests {
             elapsed.as_millis() < 100,
             "permits_trade_evaluation too slow: {elapsed:?}"
         );
+    }
+
+    // ===================================================================
+    // D-1 — panic-mode integration tests (pre-Epic-6 cleanup spec).
+    // ===================================================================
+
+    /// D-1: panic mode active → `permits_trading` denies even when every
+    /// breaker is `Active`. `reasons[0]` is `PanicModeActive`.
+    #[test]
+    fn permits_trading_denies_when_panic_active_with_panic_first() {
+        let (cb, _rx, panic_mode) = fixture_with_panic();
+        let mut cancel = NoopCancel;
+        panic_mode.activate("test", UnixNanos::new(1), &mut cancel);
+
+        let denied = cb
+            .permits_trading()
+            .expect_err("panic active must deny trading");
+        assert!(
+            matches!(denied.reasons.first(), Some(DenialReason::PanicModeActive)),
+            "PanicModeActive must be FIRST in reasons; got {:?}",
+            denied.reasons
+        );
+        assert!(denied.contains_panic_mode());
+    }
+
+    /// D-1: panic mode active AND a breaker tripped → `PanicModeActive`
+    /// still leads, the breaker reason follows.
+    #[test]
+    fn permits_trading_panic_mode_precedes_breaker_reason() {
+        let (mut cb, _rx, panic_mode) = fixture_with_panic();
+        cb.trip_breaker(BreakerType::DailyLoss, "loss".into(), UnixNanos::new(1));
+        let mut cancel = NoopCancel;
+        panic_mode.activate("test", UnixNanos::new(2), &mut cancel);
+
+        let denied = cb.permits_trading().unwrap_err();
+        assert!(matches!(denied.reasons[0], DenialReason::PanicModeActive));
+        assert!(denied.contains(BreakerType::DailyLoss));
+    }
+
+    /// D-1: panic mode inactive → `permits_trading` is `Ok` when every
+    /// breaker is `Active` (regression: panic-mode integration must not
+    /// break the happy path).
+    #[test]
+    fn permits_trading_ok_when_panic_inactive_and_breakers_active() {
+        let (cb, _rx, _panic_mode) = fixture_with_panic();
+        assert!(cb.permits_trading().is_ok());
+    }
+
+    /// D-1: `permits_trade_evaluation` follows the same panic-mode-first
+    /// ordering rule as `permits_trading`.
+    #[test]
+    fn permits_trade_evaluation_panic_mode_first() {
+        let (cb, _rx, panic_mode) = fixture_with_panic();
+        let mut cancel = NoopCancel;
+        panic_mode.activate("test", UnixNanos::new(1), &mut cancel);
+
+        let denied = cb.permits_trade_evaluation().unwrap_err();
+        assert!(matches!(denied.reasons[0], DenialReason::PanicModeActive));
+    }
+
+    /// D-1: `panic_mode()` accessor returns the same `Arc` we constructed
+    /// with — confirms shared ownership for Story 8.2's consumer task.
+    #[test]
+    fn panic_mode_accessor_returns_shared_arc() {
+        let (cb, _rx, panic_mode) = fixture_with_panic();
+        assert!(Arc::ptr_eq(cb.panic_mode(), &panic_mode));
     }
 }

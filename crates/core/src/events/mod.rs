@@ -11,5 +11,5 @@ pub use fill::FillEvent;
 pub use lifecycle::{ConnectionStateChange, HeartbeatEvent, RegimeTransition};
 pub use market::{MarketEvent, MarketEventType};
 pub use order::OrderEvent;
-pub use risk::{CircuitBreakerEvent, CircuitBreakerType};
+pub use risk::{BreakerCategory, BreakerState, BreakerType, CircuitBreakerEvent};
 pub use signal::SignalEvent;

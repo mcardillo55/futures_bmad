@@ -1,5 +1,258 @@
+//! Risk module — the circuit-breaker / gate framework that gates every
+//! order submission.
+//!
+//! Story 5.1 introduces the unified [`CircuitBreakers`] struct (see
+//! [`circuit_breakers`]). Stories 5.2–5.6 layer the per-breaker logic on
+//! top, but the API surface is fixed here and must not be reshaped without
+//! coordinated downstream updates.
+//!
+//! The hard rules from the architecture spec:
+//!
+//!   * `unsafe` is forbidden in this module (see workspace `clippy.toml`
+//!     and the per-file `#![deny(unsafe_code)]` declarations below).
+//!   * `permits_trading()` is on the hot path: no heap allocation on the
+//!     happy path (every breaker `Active` ⇒ `Ok(())` returned without
+//!     allocating the failure-side `Vec`).
+//!   * Stop-loss orders are NEVER cancelled by a circuit-breaker trip.
+//!     Only entry market orders and resting limit orders are. The
+//!     `orders_to_cancel()` helper enforces this.
+
+#![deny(unsafe_code)]
+
+pub mod circuit_breakers;
 pub mod fee_gate;
 pub mod panic_mode;
 
+use std::fmt;
+
+use futures_bmad_core::BreakerType;
+
+pub use circuit_breakers::CircuitBreakers;
 pub use fee_gate::{FeeGate, FeeGateReason};
 pub use panic_mode::{ActivationOutcome, OrderCancellation, PanicMode, PanicState};
+
+/// One specific reason `permits_trading()` denied a trade.
+///
+/// Each variant maps 1:1 to a [`BreakerType`]. The variant carries the
+/// minimum context an operator needs to make sense of the denial in a
+/// log line or alert: current vs limit values where applicable, or a
+/// terse contextual string where structured fields are not natural.
+///
+/// Kept `Clone` (rather than `Copy`) because some variants carry small
+/// `String` context fields. The hot path never constructs a `DenialReason`
+/// — the happy-path `permits_trading()` short-circuits to `Ok(())`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DenialReason {
+    /// Daily-loss breaker tripped — session P&L hit the configured cap.
+    DailyLossExceeded { current: i64, limit: i64 },
+    /// Consecutive-losses breaker tripped.
+    ConsecutiveLossesExceeded { current: u32, limit: u32 },
+    /// Max-trades-per-day breaker tripped.
+    MaxTradesExceeded { current: u32, limit: u32 },
+    /// Anomalous-position breaker tripped (panic-mode tier).
+    AnomalousPosition { detail: String },
+    /// Connection failure breaker tripped.
+    ConnectionFailure { detail: String },
+    /// Buffer-overflow breaker tripped (queue saturation).
+    BufferOverflow { occupancy_pct: f32 },
+    /// Max-position-size gate tripped (would exceed cap on next fill).
+    MaxPositionSizeExceeded { requested: u32, limit: u32 },
+    /// Data-quality gate tripped.
+    DataQualityFailure { detail: String },
+    /// Fee-staleness gate tripped (>60 day fee schedule).
+    FeeScheduleStale { days_old: i64 },
+    /// Malformed-message rate breaker tripped.
+    MalformedMessages { detail: String },
+}
+
+impl DenialReason {
+    /// The breaker/gate type this denial corresponds to.
+    pub const fn breaker_type(&self) -> BreakerType {
+        match self {
+            DenialReason::DailyLossExceeded { .. } => BreakerType::DailyLoss,
+            DenialReason::ConsecutiveLossesExceeded { .. } => BreakerType::ConsecutiveLosses,
+            DenialReason::MaxTradesExceeded { .. } => BreakerType::MaxTrades,
+            DenialReason::AnomalousPosition { .. } => BreakerType::AnomalousPosition,
+            DenialReason::ConnectionFailure { .. } => BreakerType::ConnectionFailure,
+            DenialReason::BufferOverflow { .. } => BreakerType::BufferOverflow,
+            DenialReason::MaxPositionSizeExceeded { .. } => BreakerType::MaxPositionSize,
+            DenialReason::DataQualityFailure { .. } => BreakerType::DataQuality,
+            DenialReason::FeeScheduleStale { .. } => BreakerType::FeeStaleness,
+            DenialReason::MalformedMessages { .. } => BreakerType::MalformedMessages,
+        }
+    }
+}
+
+impl fmt::Display for DenialReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DenialReason::DailyLossExceeded { current, limit } => {
+                write!(f, "daily loss {current} ticks reached limit {limit}")
+            }
+            DenialReason::ConsecutiveLossesExceeded { current, limit } => {
+                write!(f, "{current} consecutive losses reached limit {limit}")
+            }
+            DenialReason::MaxTradesExceeded { current, limit } => {
+                write!(f, "{current} trades reached daily limit {limit}")
+            }
+            DenialReason::AnomalousPosition { detail } => {
+                write!(f, "anomalous position: {detail}")
+            }
+            DenialReason::ConnectionFailure { detail } => {
+                write!(f, "connection failure: {detail}")
+            }
+            DenialReason::BufferOverflow { occupancy_pct } => {
+                write!(f, "buffer overflow at {occupancy_pct:.1}% occupancy")
+            }
+            DenialReason::MaxPositionSizeExceeded { requested, limit } => {
+                write!(f, "requested position {requested} exceeds max {limit}")
+            }
+            DenialReason::DataQualityFailure { detail } => {
+                write!(f, "data quality: {detail}")
+            }
+            DenialReason::FeeScheduleStale { days_old } => {
+                write!(f, "fee schedule {days_old} days stale")
+            }
+            DenialReason::MalformedMessages { detail } => {
+                write!(f, "malformed messages: {detail}")
+            }
+        }
+    }
+}
+
+/// Aggregated reason `permits_trading()` returned `Err`.
+///
+/// Carries every active denial reason in a single struct so the caller
+/// gets the complete picture in one place instead of having to retry the
+/// check after fixing the first failure. Construction is pushed off the
+/// hot path: only built when at least one breaker / gate is non-`Active`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TradingDenied {
+    pub reasons: Vec<DenialReason>,
+}
+
+impl TradingDenied {
+    /// Construct from an iterator of denial reasons. Empty iterators are
+    /// permitted but indicate a bug at the caller — they should produce
+    /// `Ok(())` instead. We do not panic here because that would put the
+    /// hot path into a worse state.
+    pub fn from_reasons(reasons: impl IntoIterator<Item = DenialReason>) -> Self {
+        Self {
+            reasons: reasons.into_iter().collect(),
+        }
+    }
+
+    /// Whether a denial of the given type is present in this set.
+    pub fn contains(&self, ty: BreakerType) -> bool {
+        self.reasons.iter().any(|r| r.breaker_type() == ty)
+    }
+}
+
+impl fmt::Display for TradingDenied {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "trading denied:")?;
+        for (i, reason) in self.reasons.iter().enumerate() {
+            if i == 0 {
+                write!(f, " {reason}")?;
+            } else {
+                write!(f, "; {reason}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for TradingDenied {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn denial_reason_breaker_type_mapping() {
+        let pairs = [
+            (
+                DenialReason::DailyLossExceeded {
+                    current: 1,
+                    limit: 1,
+                },
+                BreakerType::DailyLoss,
+            ),
+            (
+                DenialReason::ConsecutiveLossesExceeded {
+                    current: 1,
+                    limit: 1,
+                },
+                BreakerType::ConsecutiveLosses,
+            ),
+            (
+                DenialReason::MaxTradesExceeded {
+                    current: 1,
+                    limit: 1,
+                },
+                BreakerType::MaxTrades,
+            ),
+            (
+                DenialReason::AnomalousPosition { detail: "x".into() },
+                BreakerType::AnomalousPosition,
+            ),
+            (
+                DenialReason::ConnectionFailure { detail: "x".into() },
+                BreakerType::ConnectionFailure,
+            ),
+            (
+                DenialReason::BufferOverflow { occupancy_pct: 1.0 },
+                BreakerType::BufferOverflow,
+            ),
+            (
+                DenialReason::MaxPositionSizeExceeded {
+                    requested: 1,
+                    limit: 1,
+                },
+                BreakerType::MaxPositionSize,
+            ),
+            (
+                DenialReason::DataQualityFailure { detail: "x".into() },
+                BreakerType::DataQuality,
+            ),
+            (
+                DenialReason::FeeScheduleStale { days_old: 100 },
+                BreakerType::FeeStaleness,
+            ),
+            (
+                DenialReason::MalformedMessages { detail: "x".into() },
+                BreakerType::MalformedMessages,
+            ),
+        ];
+        for (reason, expected_type) in pairs {
+            assert_eq!(reason.breaker_type(), expected_type);
+        }
+    }
+
+    #[test]
+    fn trading_denied_display_lists_all_reasons() {
+        let denied = TradingDenied::from_reasons([
+            DenialReason::DailyLossExceeded {
+                current: 1200,
+                limit: 1000,
+            },
+            DenialReason::MaxTradesExceeded {
+                current: 31,
+                limit: 30,
+            },
+        ]);
+        let s = format!("{denied}");
+        assert!(s.contains("daily loss 1200"));
+        assert!(s.contains("31 trades"));
+        // Multi-reason rendering: separated by `;`
+        assert!(s.contains(';'));
+    }
+
+    #[test]
+    fn trading_denied_contains_finds_type() {
+        let denied =
+            TradingDenied::from_reasons([DenialReason::FeeScheduleStale { days_old: 100 }]);
+        assert!(denied.contains(BreakerType::FeeStaleness));
+        assert!(!denied.contains(BreakerType::DailyLoss));
+    }
+}

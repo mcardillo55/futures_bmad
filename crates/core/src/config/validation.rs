@@ -17,6 +17,7 @@ pub enum ConfigValidationError {
     InvalidFormat { field: String, expected: String },
     ZeroTimeout(String),
     NegativeSpreadThreshold,
+    ZeroMaxTradesPerDay,
 }
 
 impl std::fmt::Display for ConfigValidationError {
@@ -44,6 +45,7 @@ impl std::fmt::Display for ConfigValidationError {
             }
             Self::ZeroTimeout(name) => write!(f, "{name} must be > 0"),
             Self::NegativeSpreadThreshold => write!(f, "max_spread_threshold must be >= 0"),
+            Self::ZeroMaxTradesPerDay => write!(f, "max_trades_per_day must be > 0"),
         }
     }
 }
@@ -71,8 +73,11 @@ pub fn validate_trading_config(config: &TradingConfig) -> Result<(), Vec<ConfigV
             config.edge_multiple_threshold,
         ));
     }
-    if config.max_daily_loss.raw() < 0 {
+    if config.max_daily_loss_ticks < 0 {
         errors.push(ConfigValidationError::NegativeDailyLoss);
+    }
+    if config.max_trades_per_day == 0 {
+        errors.push(ConfigValidationError::ZeroMaxTradesPerDay);
     }
     if config.max_spread_threshold.raw() < 0 {
         errors.push(ConfigValidationError::NegativeSpreadThreshold);
@@ -221,12 +226,14 @@ mod tests {
         TradingConfig {
             symbol: "ES".into(),
             max_position_size: 2,
-            max_daily_loss: FixedPrice::new(400),
+            max_daily_loss_ticks: 400,
             max_consecutive_losses: 3,
+            max_trades_per_day: 30,
             edge_multiple_threshold: 1.5,
             session_start: "09:30".into(),
             session_end: "16:00".into(),
             max_spread_threshold: FixedPrice::new(4),
+            fee_schedule_date: chrono::Utc::now().date_naive(),
         }
     }
 

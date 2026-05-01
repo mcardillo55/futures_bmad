@@ -36,13 +36,7 @@ fn feed_buys(vpin: &mut VpinSignal, clock: &SimClock, book: &OrderBook, count: u
 }
 
 /// Feed N sell trades of given size into the signal.
-fn feed_sells(
-    vpin: &mut VpinSignal,
-    clock: &SimClock,
-    book: &OrderBook,
-    count: usize,
-    size: u32,
-) {
+fn feed_sells(vpin: &mut VpinSignal, clock: &SimClock, book: &OrderBook, count: usize, size: u32) {
     for _ in 0..count {
         let trade = make_trade(100.0, size, Some(Side::Sell));
         clock.advance_by(1_000_000);

@@ -1,7 +1,5 @@
 use futures_bmad_core::{FixedPrice, MarketEvent, MarketEventType, UnixNanos};
-use futures_bmad_engine::signals::{
-    LevelConfig, LevelEngine, LevelSource, LevelType, SessionData,
-};
+use futures_bmad_engine::signals::{LevelConfig, LevelEngine, LevelSource, LevelType, SessionData};
 
 fn make_trade(price_raw: i64, size: u32) -> MarketEvent {
     MarketEvent {
@@ -27,7 +25,11 @@ fn manual_levels_loaded_from_config() {
 
     let levels = engine.levels();
     assert_eq!(levels.len(), 3);
-    assert!(levels.iter().all(|l| l.level_type == LevelType::ManualLevel));
+    assert!(
+        levels
+            .iter()
+            .all(|l| l.level_type == LevelType::ManualLevel)
+    );
     assert!(levels.iter().all(|l| l.source == LevelSource::Configured));
 }
 
@@ -41,8 +43,14 @@ fn prior_day_high_low_from_session() {
     engine.load_historical(&session);
 
     let levels = engine.levels();
-    let pdh = levels.iter().find(|l| l.level_type == LevelType::PriorDayHigh).unwrap();
-    let pdl = levels.iter().find(|l| l.level_type == LevelType::PriorDayLow).unwrap();
+    let pdh = levels
+        .iter()
+        .find(|l| l.level_type == LevelType::PriorDayHigh)
+        .unwrap();
+    let pdl = levels
+        .iter()
+        .find(|l| l.level_type == LevelType::PriorDayLow)
+        .unwrap();
 
     assert_eq!(pdh.price.raw(), 18000);
     assert_eq!(pdl.price.raw(), 17900);
@@ -66,7 +74,11 @@ fn vpoc_computed_correctly() {
 
     engine.load_historical(&session);
 
-    let vpoc = engine.levels().iter().find(|l| l.level_type == LevelType::Vpoc).unwrap();
+    let vpoc = engine
+        .levels()
+        .iter()
+        .find(|l| l.level_type == LevelType::Vpoc)
+        .unwrap();
     assert_eq!(vpoc.price.raw(), 17950);
     assert_eq!(vpoc.source, LevelSource::Computed);
 }
@@ -74,11 +86,7 @@ fn vpoc_computed_correctly() {
 #[test]
 fn vpoc_tiebreak_lower_price_wins() {
     // Two prices with same volume: 17900 and 18000 both have 25
-    let session = session_from_trades(&[
-        (17900, 25),
-        (18000, 25),
-    ])
-    .unwrap();
+    let session = session_from_trades(&[(17900, 25), (18000, 25)]).unwrap();
 
     let vpoc = session.vpoc().unwrap();
     assert_eq!(vpoc.raw(), 17900, "on tie, lower price should win");
@@ -140,13 +148,26 @@ fn session_refresh_updates_levels() {
     let session2 = session_from_trades(&[(17800, 30), (17850, 10)]).unwrap();
     engine.refresh_session(&session2);
 
-    let pdh = engine.levels().iter().find(|l| l.level_type == LevelType::PriorDayHigh).unwrap();
-    let pdl = engine.levels().iter().find(|l| l.level_type == LevelType::PriorDayLow).unwrap();
+    let pdh = engine
+        .levels()
+        .iter()
+        .find(|l| l.level_type == LevelType::PriorDayHigh)
+        .unwrap();
+    let pdl = engine
+        .levels()
+        .iter()
+        .find(|l| l.level_type == LevelType::PriorDayLow)
+        .unwrap();
     assert_eq!(pdh.price.raw(), 17850);
     assert_eq!(pdl.price.raw(), 17800);
 
     // Manual level still present
-    assert!(engine.levels().iter().any(|l| l.level_type == LevelType::ManualLevel));
+    assert!(
+        engine
+            .levels()
+            .iter()
+            .any(|l| l.level_type == LevelType::ManualLevel)
+    );
 }
 
 #[test]
@@ -155,7 +176,12 @@ fn no_historical_data_manual_levels_only() {
     let engine = LevelEngine::new(config);
 
     assert_eq!(engine.levels().len(), 2);
-    assert!(engine.levels().iter().all(|l| l.level_type == LevelType::ManualLevel));
+    assert!(
+        engine
+            .levels()
+            .iter()
+            .all(|l| l.level_type == LevelType::ManualLevel)
+    );
 }
 
 #[test]

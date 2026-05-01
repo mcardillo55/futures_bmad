@@ -174,7 +174,10 @@ fn asymmetric_levels_correct_obi() {
     // total_bid = 55, total_ask = 30
     // OBI = (55 - 30) / (55 + 30) = 25/85
     let expected = 25.0 / 85.0;
-    assert!((result - expected).abs() < EPSILON, "expected {expected}, got {result}");
+    assert!(
+        (result - expected).abs() < EPSILON,
+        "expected {expected}, got {result}"
+    );
     assert_signal_in_range(result, -1.0, 1.0);
 }
 

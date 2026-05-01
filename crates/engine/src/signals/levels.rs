@@ -96,7 +96,9 @@ impl SessionData {
         let mut found = false;
 
         for (&price_raw, &volume) in &self.volume_by_price {
-            if !found || volume > best_volume || (volume == best_volume && price_raw < best_price_raw)
+            if !found
+                || volume > best_volume
+                || (volume == best_volume && price_raw < best_price_raw)
             {
                 best_price_raw = price_raw;
                 best_volume = volume;

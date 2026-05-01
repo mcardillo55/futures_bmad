@@ -30,7 +30,10 @@ fn equal_sizes_equals_simple_mid() {
     let result = mp.update(&book, None, &clock).unwrap();
     // (4482.00 * 100 + 4482.25 * 100) / 200 = (448200 + 448225) / 200 = 4482.125
     let expected = (4482.00 + 4482.25) / 2.0;
-    assert!((result - expected).abs() < EPSILON, "expected {expected}, got {result}");
+    assert!(
+        (result - expected).abs() < EPSILON,
+        "expected {expected}, got {result}"
+    );
 }
 
 #[test]
@@ -42,7 +45,10 @@ fn larger_ask_size_closer_to_bid() {
     let result = mp.update(&book, None, &clock).unwrap();
     // (4482.00 * 300 + 4482.25 * 100) / 400 = (1344600 + 448225) / 400 = 4482.0625
     let expected = 4482.0625;
-    assert!((result - expected).abs() < EPSILON, "expected {expected}, got {result}");
+    assert!(
+        (result - expected).abs() < EPSILON,
+        "expected {expected}, got {result}"
+    );
 
     let mid = (4482.00 + 4482.25) / 2.0;
     assert!(result < mid, "microprice should be closer to bid than mid");
@@ -57,7 +63,10 @@ fn larger_bid_size_closer_to_ask() {
     let result = mp.update(&book, None, &clock).unwrap();
     // (4482.00 * 100 + 4482.25 * 300) / 400 = (448200 + 1344675) / 400 = 4482.1875
     let expected = 4482.1875;
-    assert!((result - expected).abs() < EPSILON, "expected {expected}, got {result}");
+    assert!(
+        (result - expected).abs() < EPSILON,
+        "expected {expected}, got {result}"
+    );
 
     let mid = (4482.00 + 4482.25) / 2.0;
     assert!(result > mid, "microprice should be closer to ask than mid");
@@ -72,8 +81,14 @@ fn extreme_imbalance_near_bid() {
     let result = mp.update(&book, None, &clock).unwrap();
     // (4482.00 * 1000 + 4482.25 * 1) / 1001 ≈ 4482.000249750...
     let expected = (4482.00 * 1000.0 + 4482.25 * 1.0) / 1001.0;
-    assert!((result - expected).abs() < EPSILON, "expected {expected}, got {result}");
-    assert!(result < 4482.01, "with extreme ask imbalance, microprice should be very close to bid");
+    assert!(
+        (result - expected).abs() < EPSILON,
+        "expected {expected}, got {result}"
+    );
+    assert!(
+        result < 4482.01,
+        "with extreme ask imbalance, microprice should be very close to bid"
+    );
 }
 
 #[test]

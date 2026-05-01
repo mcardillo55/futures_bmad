@@ -116,11 +116,7 @@ impl CompositeEvaluator {
             };
         }
 
-        let direction = if score >= 0.0 {
-            Side::Buy
-        } else {
-            Side::Sell
-        };
+        let direction = if score >= 0.0 { Side::Buy } else { Side::Sell };
 
         // Compute expected edge
         let edge_f64 = score.abs() * self.config.historical_edge_per_unit;

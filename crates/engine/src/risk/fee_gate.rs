@@ -35,8 +35,9 @@ pub struct FeeGate {
 impl FeeGate {
     /// Construct from core FeeConfig.
     pub fn from_config(config: &FeeConfig, slippage_qticks: i64, min_edge_multiple: f64) -> Self {
-        let exchange = FixedPrice::from_f64(config.exchange_fee + config.clearing_fee + config.nfa_fee)
-            .unwrap_or(FixedPrice::new(0));
+        let exchange =
+            FixedPrice::from_f64(config.exchange_fee + config.clearing_fee + config.nfa_fee)
+                .unwrap_or(FixedPrice::new(0));
         let commission =
             FixedPrice::from_f64(config.broker_commission).unwrap_or(FixedPrice::new(0));
         let date = NaiveDate::parse_from_str(&config.effective_date, "%Y-%m-%d")
@@ -58,7 +59,9 @@ impl FeeGate {
             .exchange_fee_per_side
             .saturating_add(self.commission_per_side)
             .saturating_add(self.api_fee_per_side);
-        per_side.saturating_mul(2).saturating_add(self.slippage_model)
+        per_side
+            .saturating_mul(2)
+            .saturating_add(self.slippage_model)
     }
 
     /// Check if a trade with the given expected edge is permitted.

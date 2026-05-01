@@ -6,8 +6,7 @@ pub mod vpin;
 
 pub use composite::{CompositeConfig, CompositeEvaluator, DecisionReason, TradeDecision};
 pub use levels::{
-    LevelConfig, LevelEngine, LevelProximity, LevelSource, LevelType, SessionData,
-    StructuralLevel,
+    LevelConfig, LevelEngine, LevelProximity, LevelSource, LevelType, SessionData, StructuralLevel,
 };
 pub use microprice::MicropriceSignal;
 pub use obi::ObiSignal;

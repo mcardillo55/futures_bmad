@@ -138,6 +138,12 @@ Note: S-2 from this review (partial entry over-sizes SL/TP via warn-only) is the
 
 - **Producer fires `FlattenRequest` even while panic mode is active** — Once panic mode is engaged, `PanicMode::activate_with_context` fires its own flatten. The anomaly producer running in parallel can publish duplicate flattens. Resolution: producer skips when `breakers.panic_mode().is_trading_enabled() == false`, OR consumer (Story 8.2 `handle_anomaly` wrapper) checks panic state before submitting. Owned by Story 8.2. [`crates/engine/src/event_loop.rs` per-tick anomaly check]
 
+## Deferred from: code review of story-6.2 (2026-05-01)
+
+- S-1: `last_transition_time` not updated on conservative collapse (`conservative_on_oscillation = true`). When an oscillation collapses `current_regime` to a safer state, the cooldown anchor stays pinned to the original acted-upon transition, not to the collapse instant. The field doc comment says "last timestamp at which a transition was acted upon" — a conservative collapse IS a state-change acted upon. Either update the anchor or explicitly document the single-anchor semantics with the rationale. [`crates/engine/src/regime/orchestrator.rs:165-192`]
+- S-2: `pending_transitions: Vec<RegimeTransition>` accumulates every cooldown-suppressed oscillation and is never cleared. Only accessed by a test helper; no production consumer drains it. In a long-running session with persistent oscillation near a threshold boundary, the vector grows monotonically. Recommend: clear on cooldown expiry (non-cooldown path at line 190), or replace with a `u32` oscillation counter. [`crates/engine/src/regime/orchestrator.rs:77, 169`]
+- N-3: `apply_strategy_permissions` silently disables all strategies when `regime_strategy_map` does not contain a key for the new regime. Fail-closed is the correct safety default, but an operator who misconfigures the TOML map by omitting a regime key gets no warning. Add `tracing::warn!` in the `None` branch and a test covering the incomplete-map scenario. [`crates/engine/src/regime/orchestrator.rs:218-225`]
+
 ## Deferred from: code review of story-6.1 (2026-05-01)
 
 - N-1: No test for the `above_volatile && strong_persistence → Rotational` classify branch (the "trending-volatile" quadrant). Implementation is correct per spec; gap is test documentation. Add `volatile_trending_simultaneous_classifies_as_rotational` test. [`crates/engine/src/regime/threshold.rs:232-238`]

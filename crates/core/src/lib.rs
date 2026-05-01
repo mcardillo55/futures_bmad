@@ -5,9 +5,9 @@ pub mod traits;
 pub mod types;
 
 pub use config::{
-    BrokerConfig, ConfigValidationError, EventAction, EventWindowConfig, FeeConfig, TradingConfig,
-    validate_all, validate_broker_config, validate_event_window_config, validate_fee_config,
-    validate_trading_config,
+    AlertingConfig, BrokerConfig, ConfigValidationError, EventAction, EventWindowConfig, FeeConfig,
+    TradingConfig, validate_all, validate_broker_config, validate_event_window_config,
+    validate_fee_config, validate_trading_config,
 };
 pub use events::{
     BreakerCategory, BreakerState, BreakerType, CircuitBreakerEvent, ConnectionStateChange,

@@ -44,6 +44,7 @@ use futures_bmad_core::{
 };
 use tracing::{info, warn};
 
+use super::alerting::{Alert, AlertSender, PositionSnapshot};
 use super::{DenialReason, TradingDenied};
 
 /// Per-state tracking for the ten breakers / gates.
@@ -100,6 +101,12 @@ pub struct CircuitBreakers {
     malformed_messages_detail: String,
 
     journal: Sender<CircuitBreakerEvent>,
+
+    /// Operator-alert sender (Story 5.6). When `Some`, every `trip_breaker`
+    /// for a `BreakerCategory::Breaker` type also emits an [`Alert`] with
+    /// severity `Error`. Gates explicitly do NOT route through this path —
+    /// gate transitions remain routine structured-log events.
+    alerts: Option<AlertSender>,
 }
 
 impl CircuitBreakers {
@@ -142,7 +149,17 @@ impl CircuitBreakers {
             malformed_messages_detail: String::new(),
 
             journal,
+            alerts: None,
         }
+    }
+
+    /// Wire an [`AlertSender`] in for breaker (not gate) trips. Story 5.6
+    /// — see module docs in `alerting.rs`. Gates are deliberately excluded
+    /// from alerting; their routine activations are structured-log events
+    /// only.
+    pub fn with_alerts(mut self, alerts: AlertSender) -> Self {
+        self.alerts = Some(alerts);
+        self
     }
 
     /// All breakers green ⇒ `Ok(())` without allocation. Otherwise returns
@@ -250,6 +267,21 @@ impl CircuitBreakers {
         reason: String,
         timestamp: UnixNanos,
     ) -> CircuitBreakerEvent {
+        self.trip_breaker_with_context(breaker_type, reason, timestamp, None, 0)
+    }
+
+    /// Trip a breaker and additionally produce an operator alert payload
+    /// containing the supplied position snapshot and current P&L (Story 5.6,
+    /// Task 6.1). For gate-category trips no alert is emitted regardless of
+    /// the supplied context — gates do not route through alerting.
+    pub fn trip_breaker_with_context(
+        &mut self,
+        breaker_type: BreakerType,
+        reason: String,
+        timestamp: UnixNanos,
+        position: Option<PositionSnapshot>,
+        current_pnl: i64,
+    ) -> CircuitBreakerEvent {
         let previous = self.state(breaker_type);
         if matches!(previous, BreakerState::Tripped) {
             // Idempotent — return the current event without re-emitting.
@@ -260,6 +292,21 @@ impl CircuitBreakers {
                 previous_state: previous,
                 new_state: previous,
             };
+        }
+
+        // Story 5.6: emit operator alert for breaker-category trips ONLY.
+        // Gates are routine recoverable events and stay in structured logs.
+        if let Some(sender) = &self.alerts
+            && matches!(breaker_type.category(), BreakerCategory::Breaker)
+        {
+            let snapshot = position.clone().unwrap_or_else(PositionSnapshot::flat_unknown);
+            sender.send(Alert::for_breaker(
+                breaker_type,
+                reason.clone(),
+                timestamp,
+                snapshot,
+                current_pnl,
+            ));
         }
 
         // Capture context strings for cold-path denial rendering.
@@ -734,5 +781,107 @@ mod tests {
             elapsed.as_millis() < 100,
             "permits_trading too slow: {elapsed:?}"
         );
+    }
+
+    // ----- Story 5.6: alerting integration -----
+
+    fn alerting_fixture() -> (
+        CircuitBreakers,
+        Receiver<CircuitBreakerEvent>,
+        super::super::alerting::AlertReceiver,
+    ) {
+        use super::super::alerting::alert_channel;
+        let (tx, rx) = unbounded();
+        let (alerts_tx, alerts_rx) = alert_channel();
+        let cb = CircuitBreakers::new(&test_config(), tx).with_alerts(alerts_tx);
+        (cb, rx, alerts_rx)
+    }
+
+    /// Task 7.1 + 6.1: tripping a breaker (not gate) emits an alert with all
+    /// the required fields.
+    #[test]
+    fn breaker_trip_emits_alert_with_all_fields() {
+        use super::super::alerting::{AlertSeverity, BreakerKind, PositionSnapshot};
+        use futures_bmad_core::Side;
+
+        let (mut cb, _journal, alerts_rx) = alerting_fixture();
+        let snapshot = PositionSnapshot {
+            symbol: "ESM6".to_string(),
+            size: 2,
+            side: Some(Side::Buy),
+            unrealized_pnl: -42,
+        };
+        cb.trip_breaker_with_context(
+            BreakerType::DailyLoss,
+            "session loss limit hit".into(),
+            UnixNanos::new(1_700_000_000),
+            Some(snapshot),
+            -250,
+        );
+        let alert = alerts_rx.try_recv().expect("breaker trip emits alert");
+        assert_eq!(alert.severity, AlertSeverity::Error);
+        assert!(matches!(
+            alert.breaker_type,
+            BreakerKind::Circuit(BreakerType::DailyLoss)
+        ));
+        assert_eq!(alert.trigger_reason, "session loss limit hit");
+        assert_eq!(alert.timestamp, 1_700_000_000);
+        assert_eq!(alert.position_state.symbol, "ESM6");
+        assert_eq!(alert.current_pnl, -250);
+    }
+
+    /// Task 6.3 + 7.2: gate trips do NOT emit alerts.
+    #[test]
+    fn gate_trip_does_not_emit_alert() {
+        let (mut cb, _journal, alerts_rx) = alerting_fixture();
+        cb.trip_breaker(
+            BreakerType::DataQuality,
+            "stale tick".into(),
+            UnixNanos::new(1),
+        );
+        cb.trip_breaker(
+            BreakerType::FeeStaleness,
+            "schedule old".into(),
+            UnixNanos::new(2),
+        );
+        cb.trip_breaker(
+            BreakerType::MaxPositionSize,
+            "would exceed cap".into(),
+            UnixNanos::new(3),
+        );
+        // Channel must be empty — no alerts emitted for gates.
+        assert!(alerts_rx.try_recv().is_err());
+    }
+
+    /// Without `with_alerts`, no alerts are emitted even on breaker trips —
+    /// preserves backwards compatibility with sites that haven't opted in.
+    #[test]
+    fn breaker_trip_without_alert_sender_is_silent() {
+        let (mut cb, _journal) = fixture();
+        cb.trip_breaker(
+            BreakerType::DailyLoss,
+            "loss".into(),
+            UnixNanos::new(1),
+        );
+        // Compiles and runs without panicking.
+    }
+
+    /// Idempotent re-trip does not re-emit an alert.
+    #[test]
+    fn idempotent_trip_does_not_double_alert() {
+        let (mut cb, _journal, alerts_rx) = alerting_fixture();
+        cb.trip_breaker(
+            BreakerType::DailyLoss,
+            "first".into(),
+            UnixNanos::new(1),
+        );
+        cb.trip_breaker(
+            BreakerType::DailyLoss,
+            "second".into(),
+            UnixNanos::new(2),
+        );
+        // First trip emits, second is a no-op.
+        assert!(alerts_rx.try_recv().is_ok());
+        assert!(alerts_rx.try_recv().is_err());
     }
 }

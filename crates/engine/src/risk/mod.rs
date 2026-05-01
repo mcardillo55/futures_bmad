@@ -6,6 +6,14 @@
 //! top, but the API surface is fixed here and must not be reshaped without
 //! coordinated downstream updates.
 //!
+//! Story 5.6 adds the operator-alerting plumbing in [`alerting`]: a
+//! dedicated JSON-lines alert log, a bounded crossbeam channel, and an
+//! optional fire-and-forget external script invocation. Producers are
+//! [`circuit_breakers::CircuitBreakers`] (on `trip_breaker`) and
+//! [`panic_mode::PanicMode`] (on `activate`); gate transitions explicitly
+//! do NOT route through alerting (they remain routine structured-log
+//! events).
+//!
 //! The hard rules from the architecture spec:
 //!
 //!   * `unsafe` is forbidden in this module (see workspace `clippy.toml`
@@ -19,6 +27,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod alerting;
 pub mod circuit_breakers;
 pub mod event_windows;
 pub mod fee_gate;
@@ -28,10 +37,15 @@ use std::fmt;
 
 use futures_bmad_core::BreakerType;
 
+pub use alerting::{
+    ALERT_CHANNEL_CAPACITY, Alert, AlertManager, AlertReceiver, AlertSender, AlertSeverity,
+    BreakerKind, DEFAULT_SCRIPT_TIMEOUT, FlattenAttemptDetail, PositionSnapshot,
+    SharedAlertSender, alert_channel,
+};
 pub use circuit_breakers::CircuitBreakers;
 pub use event_windows::{ActiveEvent, EventWindowManager, TradingRestriction};
 pub use fee_gate::{FeeGate, FeeGateReason};
-pub use panic_mode::{ActivationOutcome, OrderCancellation, PanicMode, PanicState};
+pub use panic_mode::{ActivationOutcome, OrderCancellation, PanicContext, PanicMode, PanicState};
 
 /// One specific reason `permits_trading()` denied a trade.
 ///

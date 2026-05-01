@@ -71,6 +71,7 @@ bumpalo = { version = "3.20.2" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
 
 # Async utilities
 async-trait = { version = "0.1" }

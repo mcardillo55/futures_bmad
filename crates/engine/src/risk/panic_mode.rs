@@ -23,6 +23,9 @@ use tracing::error;
 use crate::persistence::journal::{
     CircuitBreakerEventRecord, EngineEvent as JournalEvent, JournalSender, SystemEventRecord,
 };
+use crate::risk::alerting::{
+    Alert, AlertSender, FlattenAttemptDetail, PositionSnapshot,
+};
 
 /// Two-state panic discriminator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +58,9 @@ pub trait OrderCancellation {
 pub struct PanicMode {
     panic_active: AtomicBool,
     journal: JournalSender,
+    /// Optional operator-alert producer. When `Some`, [`activate`] emits a
+    /// [`Alert`] with `Critical` severity and full flatten-attempt context.
+    alerts: Option<AlertSender>,
 }
 
 impl PanicMode {
@@ -62,6 +68,17 @@ impl PanicMode {
         Self {
             panic_active: AtomicBool::new(false),
             journal,
+            alerts: None,
+        }
+    }
+
+    /// Construct with an [`AlertSender`] wired in so panic-mode escalation
+    /// produces an operator alert (Story 5.6, Task 6.2).
+    pub fn new_with_alerts(journal: JournalSender, alerts: AlertSender) -> Self {
+        Self {
+            panic_active: AtomicBool::new(false),
+            journal,
+            alerts: Some(alerts),
         }
     }
 
@@ -102,6 +119,23 @@ impl PanicMode {
         now: UnixNanos,
         cancellation: &mut C,
     ) -> ActivationOutcome {
+        self.activate_with_context(reason, now, cancellation, None)
+    }
+
+    /// Activate panic mode, additionally emitting a `Critical` operator alert
+    /// containing the supplied flatten-attempt history and position snapshot
+    /// (Story 5.6, Task 3 + Task 6.2).
+    ///
+    /// `context` is `None` when no alerting is configured or when the caller
+    /// has no flatten-attempt history to provide; in that case the existing
+    /// activation semantics apply unchanged.
+    pub fn activate_with_context<C: OrderCancellation>(
+        &self,
+        reason: &str,
+        now: UnixNanos,
+        cancellation: &mut C,
+        context: Option<PanicContext>,
+    ) -> ActivationOutcome {
         // Compare-exchange so a concurrent or duplicate activate() doesn't
         // double-cancel or double-journal.
         let was_normal = self
@@ -120,6 +154,23 @@ impl PanicMode {
             alert = true,
             "PANIC MODE ACTIVATED — all trading disabled, manual restart required"
         );
+
+        // 1b. Operator-alert channel (Story 5.6). Fire-and-forget; the
+        //     channel is bounded and falling-behind is logged at warn but
+        //     never blocks panic-mode activation.
+        if let Some(sender) = &self.alerts {
+            let (position, current_pnl, flatten_attempts) = match context {
+                Some(c) => (c.position, c.current_pnl, c.flatten_attempts),
+                None => (PositionSnapshot::flat_unknown(), 0, Vec::new()),
+            };
+            sender.send(Alert::for_panic(
+                reason,
+                now,
+                position,
+                current_pnl,
+                flatten_attempts,
+            ));
+        }
 
         // 2. Cancel pending entries and limits (stops preserved).
         let cancelled = cancellation.cancel_entries_and_limits();
@@ -148,6 +199,18 @@ impl PanicMode {
             cancelled_entries_and_limits: cancelled,
         }
     }
+}
+
+/// Activation context captured by the engine event-loop and forwarded to
+/// [`PanicMode::activate_with_context`].
+///
+/// Passing this through (rather than re-deriving inside `PanicMode`) keeps
+/// `PanicMode` agnostic of the order-manager / position-tracker shape.
+#[derive(Debug, Clone)]
+pub struct PanicContext {
+    pub position: PositionSnapshot,
+    pub current_pnl: i64,
+    pub flatten_attempts: Vec<FlattenAttemptDetail>,
 }
 
 /// Result of an activation request.
@@ -291,6 +354,68 @@ mod tests {
         ));
         assert!(pm.is_active());
         assert!(!pm.is_trading_enabled());
+    }
+
+    /// Story 5.6 Task 6.2 — when an [`AlertSender`] is wired in, panic-mode
+    /// activation produces a `Critical` alert with the supplied position
+    /// snapshot, current P&L, and flatten-attempt history.
+    #[test]
+    fn activate_emits_critical_alert_with_flatten_context() {
+        use crate::risk::alerting::{
+            AlertSeverity, BreakerKind, FlattenAttemptDetail, PositionSnapshot, alert_channel,
+        };
+        use futures_bmad_core::Side;
+
+        let (sender, receiver) = alert_channel();
+        let pm = PanicMode::new_with_alerts(journal(), sender);
+        let mut mock = MockCancellation::default();
+
+        let context = PanicContext {
+            position: PositionSnapshot {
+                symbol: "ESM6".to_string(),
+                size: 2,
+                side: Some(Side::Buy),
+                unrealized_pnl: -120,
+            },
+            current_pnl: -150,
+            flatten_attempts: vec![FlattenAttemptDetail {
+                attempt_number: 1,
+                order_details: "FLATTEN ESM6 SELL 2".into(),
+                rejection_reason: Some("ExchangeReject".into()),
+                timestamp: 100,
+            }],
+        };
+
+        let outcome = pm.activate_with_context(
+            "flatten retry exhausted",
+            UnixNanos::new(500),
+            &mut mock,
+            Some(context),
+        );
+        assert!(matches!(outcome, ActivationOutcome::JustActivated { .. }));
+
+        let alert = receiver
+            .try_recv()
+            .expect("alert must be sent on activation");
+        assert_eq!(alert.severity, AlertSeverity::Critical);
+        assert!(matches!(alert.breaker_type, BreakerKind::PanicMode));
+        assert_eq!(alert.trigger_reason, "flatten retry exhausted");
+        assert_eq!(alert.timestamp, 500);
+        assert_eq!(alert.current_pnl, -150);
+        assert_eq!(alert.position_state.symbol, "ESM6");
+        let attempts = alert.flatten_attempts.expect("flatten_attempts populated");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].attempt_number, 1);
+    }
+
+    /// Without an [`AlertSender`] wired in, the original behaviour is
+    /// preserved — no alert is sent, journal records are still written.
+    #[test]
+    fn activate_without_alert_sender_is_unchanged() {
+        let pm = PanicMode::new(journal());
+        let mut mock = MockCancellation::default();
+        let outcome = pm.activate("plain", UnixNanos::new(1), &mut mock);
+        assert!(matches!(outcome, ActivationOutcome::JustActivated { .. }));
     }
 
     /// Activation writes a CircuitBreakerEvent and a SystemEvent to the journal.

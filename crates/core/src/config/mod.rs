@@ -1,8 +1,10 @@
+mod alerting;
 mod broker;
 mod fees;
 mod trading;
 mod validation;
 
+pub use alerting::AlertingConfig;
 pub use broker::BrokerConfig;
 pub use fees::FeeConfig;
 pub use trading::{EventAction, EventWindowConfig, TradingConfig};

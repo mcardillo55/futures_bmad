@@ -16,3 +16,15 @@
 [logging]
 # level = "info"
 # format = "json"
+
+[alerting]
+# Story 5.6 — Operator alerting on circuit-breaker events.
+# Dedicated alert log (JSON lines, fsync per write, never rotated by the engine).
+# alert_log_path = "data/alerts.log"
+#
+# Optional external notification script. Receives the alert JSON on stdin.
+# Failure is logged at warn and never blocks the trading hot path.
+# alert_script_path = "/usr/local/bin/notify-operator.sh"
+#
+# Script timeout in milliseconds (default 10000).
+# alert_script_timeout_ms = 10000

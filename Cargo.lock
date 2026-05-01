@@ -737,6 +737,8 @@ dependencies = [
  "parquet",
  "rtrb",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tikv-jemallocator",

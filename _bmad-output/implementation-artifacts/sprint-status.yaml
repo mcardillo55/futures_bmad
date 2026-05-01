@@ -87,7 +87,7 @@ development_status:
   5-3-anomalous-position-detection-and-panic-mode: ready-for-dev
   5-4-infrastructure-breakers: ready-for-dev
   5-5-event-aware-trading-windows: review
-  5-6-operator-alerting-on-circuit-breaker-events: ready-for-dev
+  5-6-operator-alerting-on-circuit-breaker-events: review
   epic-5-retrospective: optional
 
   # Epic 6: Regime Detection & Strategy Orchestration

@@ -138,6 +138,11 @@ Note: S-2 from this review (partial entry over-sizes SL/TP via warn-only) is the
 
 - **Producer fires `FlattenRequest` even while panic mode is active** — Once panic mode is engaged, `PanicMode::activate_with_context` fires its own flatten. The anomaly producer running in parallel can publish duplicate flattens. Resolution: producer skips when `breakers.panic_mode().is_trading_enabled() == false`, OR consumer (Story 8.2 `handle_anomaly` wrapper) checks panic state before submitting. Owned by Story 8.2. [`crates/engine/src/event_loop.rs` per-tick anomaly check]
 
+## Deferred from: code review of story-6.1 (2026-05-01)
+
+- N-1: No test for the `above_volatile && strong_persistence → Rotational` classify branch (the "trending-volatile" quadrant). Implementation is correct per spec; gap is test documentation. Add `volatile_trending_simultaneous_classifies_as_rotational` test. [`crates/engine/src/regime/threshold.rs:232-238`]
+- N-2: `compute_atr` uses `r1 = high - low` (no `.abs()`). For malformed bars where `high < low`, True Range is silently understated (falls back to `max(r2, r3)` instead of the correct `|high - low|`). Not a live-trading risk (real market data always has `high >= low`) but latent for fuzz/replay scenarios. Fix: change to `(high - low).abs()`. [`crates/engine/src/regime/threshold.rs:155`]
+
 ---
 
 ## Live-Trading Exit Gates

@@ -1,6 +1,6 @@
 # Story 6.1: Threshold-Based Regime Detector
 
-Status: review
+Status: done
 
 ## Story
 
@@ -162,3 +162,11 @@ claude-opus-4-7
 | Date       | Version | Description                                                                                       | Author    |
 |------------|---------|---------------------------------------------------------------------------------------------------|-----------|
 | 2026-05-01 | 0.1.0   | Initial implementation of `ThresholdRegimeDetector` (Story 6.1) — V1 threshold-based regime classifier with ATR / directional persistence / range-body ratio inputs; 11 new tests; status moved to review. | Amelia (claude-opus-4-7) |
+| 2026-05-01 | 0.1.1   | Code review complete — 0 BLOCKING / 0 SHOULD-FIX / 4 NICE-TO-HAVE; status set to done. | Reviewer (claude-sonnet-4-6) |
+
+### Review Findings
+
+- [x] [Review][Defer] Missing test for `above_volatile && strong_persistence → Rotational` branch [`crates/engine/src/regime/threshold.rs:232-238`] — deferred, pre-existing gap (no blocking correctness issue; NICE-TO-HAVE test documentation)
+- [x] [Review][Defer] `compute_atr` uses unsigned subtraction `high - low` without `.abs()` — latent for malformed bars but not triggered by well-formed market data [`crates/engine/src/regime/threshold.rs:155`] — deferred, pre-existing
+- [x] [Review][Defer] Redundant `&& .capacity() > 0` guard in `push_bar` and `record_atr_sample` — harmless, buffer_capacity always >= 1 [`crates/engine/src/regime/threshold.rs:242,249`] — deferred, pre-existing
+- [x] [Review][Defer] `atr_trending_threshold` accepted via config/TOML but never consulted in V1 classify(); no explicit operator warning beyond the struct doc comment [`crates/engine/src/regime/threshold.rs:54-58`] — deferred, pre-existing (intentional V2 reservation)

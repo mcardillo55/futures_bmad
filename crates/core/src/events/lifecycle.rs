@@ -1,12 +1,4 @@
-use crate::traits::RegimeState;
 use crate::types::UnixNanos;
-
-#[derive(Debug, Clone, Copy)]
-pub struct RegimeTransition {
-    pub from: RegimeState,
-    pub to: RegimeState,
-    pub timestamp: UnixNanos,
-}
 
 #[derive(Debug, Clone)]
 pub struct ConnectionStateChange {

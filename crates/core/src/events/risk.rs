@@ -16,7 +16,26 @@
 //! `CircuitBreakerEvent` is the audit-trail record sent through the journal
 //! channel each time a breaker trips or a gate clears.
 
+use crate::traits::RegimeState;
 use crate::types::UnixNanos;
+
+/// Regime transition audit-trail event.
+///
+/// Emitted by the regime orchestrator (story 6.2) when the classifier reports
+/// a different [`RegimeState`] than the currently-acted-upon regime. The
+/// `from -> to` pair is captured at the instant the orchestrator observes
+/// the change; `timestamp` is the orchestrator's clock-source timestamp at
+/// observation, **not** the bar timestamp that produced the classification.
+///
+/// Carried both as an in-memory event on the engine bus
+/// ([`crate::events::EngineEvent::Regime`]) and persisted into the event
+/// journal's `regime_transitions` table for post-hoc analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegimeTransition {
+    pub from: RegimeState,
+    pub to: RegimeState,
+    pub timestamp: UnixNanos,
+}
 
 /// Whether a breaker auto-clears when its underlying condition resolves
 /// (`Gate`) or whether it persists until the operator restarts the process

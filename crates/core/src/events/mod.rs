@@ -8,8 +8,8 @@ mod signal;
 
 pub use engine::EngineEvent;
 pub use fill::FillEvent;
-pub use lifecycle::{ConnectionStateChange, HeartbeatEvent, RegimeTransition};
+pub use lifecycle::{ConnectionStateChange, HeartbeatEvent};
 pub use market::{MarketEvent, MarketEventType};
 pub use order::OrderEvent;
-pub use risk::{BreakerCategory, BreakerState, BreakerType, CircuitBreakerEvent};
+pub use risk::{BreakerCategory, BreakerState, BreakerType, CircuitBreakerEvent, RegimeTransition};
 pub use signal::SignalEvent;

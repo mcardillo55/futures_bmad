@@ -17,6 +17,8 @@
 
 #![deny(unsafe_code)]
 
+pub mod orchestrator;
 pub mod threshold;
 
+pub use orchestrator::RegimeOrchestrator;
 pub use threshold::{ThresholdRegimeConfig, ThresholdRegimeDetector};

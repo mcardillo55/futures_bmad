@@ -74,3 +74,7 @@ serde = { version = "1", features = ["derive"] }
 
 # Async utilities
 async-trait = { version = "0.1" }
+
+# TOML parsing (dev-dependencies only — runtime config loads via the
+# `config` crate; tests parse TOML strings directly to verify deserialisers).
+toml = { version = "0.8" }

@@ -13,3 +13,4 @@ secrecy = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+toml = { workspace = true }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use futures_bmad_core::{Clock, OrderBook};
+use futures_bmad_core::{Clock, EventWindowConfig, OrderBook};
 use tracing::info;
 
 use crate::buffer_monitor::{BufferMonitor, BufferState};
@@ -9,6 +9,7 @@ use crate::data_quality::{
     DataQualityGate, GateReason, GateState, SequenceGapDetector, StaleDataDetector,
 };
 use crate::order_book::apply_market_event;
+use crate::risk::{EventWindowManager, TradingRestriction};
 use crate::spsc::MarketEventConsumer;
 
 /// How often to check for stale data (in loop iterations).
@@ -16,6 +17,13 @@ const STALE_CHECK_INTERVAL: u64 = 1000;
 
 /// Hot-path event loop that consumes MarketEvents from SPSC and updates OrderBook.
 /// Runs on a dedicated pinned core. Never allocates after initialization.
+///
+/// Story 5.5 introduced the [`EventWindowManager`] field. The event-window
+/// layer is a wall-clock-scheduled trading restriction that is evaluated
+/// AFTER the circuit-breaker gate (story 5.1) — see
+/// [`Self::current_trading_restriction`]. Event windows do NOT trip
+/// breakers; they are an orthogonal restriction that shrinks the set of
+/// permitted actions for the duration of a high-impact news release.
 pub struct EventLoop<C: Clock> {
     consumer: MarketEventConsumer,
     book: OrderBook,
@@ -23,6 +31,7 @@ pub struct EventLoop<C: Clock> {
     stale_detector: StaleDataDetector,
     seq_detector: SequenceGapDetector,
     gate: DataQualityGate,
+    event_windows: EventWindowManager,
     clock: C,
     events_processed: u64,
     tick_count: u64,
@@ -43,6 +52,20 @@ impl EventLoopHandle {
 
 impl<C: Clock> EventLoop<C> {
     pub fn new(consumer: MarketEventConsumer, clock: C, stale_threshold_secs: f64) -> Self {
+        Self::with_event_windows(consumer, clock, stale_threshold_secs, &[])
+    }
+
+    /// Construct with a populated event-window manager.
+    ///
+    /// `events` is the `events: Vec<EventWindowConfig>` field from
+    /// `TradingConfig`. Pass `&[]` (or use [`Self::new`]) when no
+    /// wall-clock event restrictions are configured.
+    pub fn with_event_windows(
+        consumer: MarketEventConsumer,
+        clock: C,
+        stale_threshold_secs: f64,
+        events: &[EventWindowConfig],
+    ) -> Self {
         Self {
             consumer,
             book: OrderBook::empty(),
@@ -50,6 +73,7 @@ impl<C: Clock> EventLoop<C> {
             stale_detector: StaleDataDetector::new(stale_threshold_secs),
             seq_detector: SequenceGapDetector::new(),
             gate: DataQualityGate::new(),
+            event_windows: EventWindowManager::new(events),
             clock,
             events_processed: 0,
             tick_count: 0,
@@ -169,6 +193,27 @@ impl<C: Clock> EventLoop<C> {
 
     pub fn events_processed(&self) -> u64 {
         self.events_processed
+    }
+
+    /// Most-restrictive event-window restriction currently in effect, or
+    /// `None` when no event window is active.
+    ///
+    /// Story 5.5 contract — called by the (future) signal-evaluation step
+    /// AFTER the circuit-breaker `permits_trading` gate. Event windows do
+    /// not trip breakers; they restrict what new trades are permitted
+    /// while wall-clock-scheduled high-impact news releases are live.
+    ///
+    /// This DOES drive the manager's edge-triggered activation /
+    /// resumption logging — call once per evaluation pass, not once per
+    /// signal.
+    pub fn current_trading_restriction(&mut self) -> Option<TradingRestriction> {
+        self.event_windows.get_trading_restriction(&self.clock)
+    }
+
+    /// Number of configured event windows. `0` when no `[[events]]` array
+    /// was present in the trading config.
+    pub fn event_window_count(&self) -> usize {
+        self.event_windows.len()
     }
 }
 
@@ -316,5 +361,86 @@ mod tests {
 
         // Gate should NOT be activated — market is closed
         assert!(event_loop.is_data_quality_ok());
+    }
+
+    // ----- story 5.5 — event-window integration -----
+
+    use chrono::{NaiveDate, TimeZone, Utc};
+    use futures_bmad_core::{EventAction, EventWindowConfig};
+
+    fn fomc_window() -> EventWindowConfig {
+        EventWindowConfig {
+            name: "FOMC".into(),
+            start: NaiveDate::from_ymd_opt(2026, 4, 16)
+                .unwrap()
+                .and_hms_opt(14, 0, 0)
+                .unwrap(),
+            end: None,
+            duration_minutes: Some(120),
+            action: EventAction::SitOut,
+        }
+    }
+
+    /// Default `EventLoop::new` constructor uses an empty event-window manager.
+    #[test]
+    fn default_event_loop_has_no_event_windows() {
+        let (_producer, consumer) = market_event_queue(16);
+        let clock = SimClock::new(BASE_TS);
+        let mut event_loop = EventLoop::new(consumer, clock, 3.0);
+        assert_eq!(event_loop.event_window_count(), 0);
+        assert_eq!(event_loop.current_trading_restriction(), None);
+    }
+
+    /// `with_event_windows` accepts a config slice and counts loaded windows.
+    #[test]
+    fn with_event_windows_loads_configs() {
+        let (_producer, consumer) = market_event_queue(16);
+        let clock = SimClock::new(BASE_TS);
+        let event_loop =
+            EventLoop::with_event_windows(consumer, clock, 3.0, &[fomc_window()]);
+        assert_eq!(event_loop.event_window_count(), 1);
+    }
+
+    /// 6.1/6.2 — when an event window is active, `current_trading_restriction`
+    /// surfaces the configured action so the (future) signal evaluator can
+    /// short-circuit / reduce limits.
+    #[test]
+    fn restriction_surfaced_when_window_active() {
+        let (_producer, consumer) = market_event_queue(16);
+        let inside = Utc.with_ymd_and_hms(2026, 4, 16, 14, 30, 0).unwrap();
+        let nanos = inside.timestamp_nanos_opt().unwrap() as u64;
+        let clock = SimClock::new(nanos);
+
+        let mut event_loop =
+            EventLoop::with_event_windows(consumer, clock, 3.0, &[fomc_window()]);
+        assert_eq!(
+            event_loop.current_trading_restriction(),
+            Some(TradingRestriction::SitOut)
+        );
+    }
+
+    /// 6.3/6.4 — event windows are an orthogonal restriction layer; they
+    /// neither emit data-quality gate events nor flip the buffer state.
+    /// The event-loop tick path is unchanged when an event window is
+    /// active — only the consumer-side `current_trading_restriction`
+    /// query changes.
+    #[test]
+    fn active_window_does_not_affect_data_quality_or_buffer() {
+        let (mut producer, consumer) = market_event_queue(16);
+        let inside = Utc.with_ymd_and_hms(2026, 4, 16, 14, 30, 0).unwrap();
+        let nanos = inside.timestamp_nanos_opt().unwrap() as u64;
+        let clock = SimClock::new(nanos);
+
+        let mut event_loop =
+            EventLoop::with_event_windows(consumer, clock, 3.0, &[fomc_window()]);
+
+        producer.try_push(make_bid(18000, 50, nanos));
+        let state = event_loop.tick();
+        assert_eq!(state, BufferState::Normal);
+        assert!(event_loop.is_data_quality_ok());
+        assert_eq!(
+            event_loop.current_trading_restriction(),
+            Some(TradingRestriction::SitOut)
+        );
     }
 }

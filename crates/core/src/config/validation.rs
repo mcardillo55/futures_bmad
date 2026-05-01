@@ -1,4 +1,4 @@
-use super::{BrokerConfig, FeeConfig, TradingConfig};
+use super::{BrokerConfig, EventWindowConfig, FeeConfig, TradingConfig};
 use chrono::NaiveDate;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,6 +18,14 @@ pub enum ConfigValidationError {
     ZeroTimeout(String),
     NegativeSpreadThreshold,
     ZeroMaxTradesPerDay,
+    /// Event window must specify exactly one of `end` or `duration_minutes`.
+    EventWindowEndOrDurationRequired { name: String },
+    /// Event window cannot specify both `end` and `duration_minutes`.
+    EventWindowEndAndDurationConflict { name: String },
+    /// Event window's resolved end <= start (zero-or-negative duration).
+    EventWindowNonPositiveDuration { name: String },
+    /// `duration_minutes = 0` is not a valid event window.
+    EventWindowZeroDuration { name: String },
 }
 
 impl std::fmt::Display for ConfigValidationError {
@@ -46,6 +54,20 @@ impl std::fmt::Display for ConfigValidationError {
             Self::ZeroTimeout(name) => write!(f, "{name} must be > 0"),
             Self::NegativeSpreadThreshold => write!(f, "max_spread_threshold must be >= 0"),
             Self::ZeroMaxTradesPerDay => write!(f, "max_trades_per_day must be > 0"),
+            Self::EventWindowEndOrDurationRequired { name } => write!(
+                f,
+                "event window '{name}': must specify either 'end' or 'duration_minutes'"
+            ),
+            Self::EventWindowEndAndDurationConflict { name } => write!(
+                f,
+                "event window '{name}': must not specify both 'end' and 'duration_minutes'"
+            ),
+            Self::EventWindowNonPositiveDuration { name } => {
+                write!(f, "event window '{name}': end must be after start")
+            }
+            Self::EventWindowZeroDuration { name } => {
+                write!(f, "event window '{name}': duration_minutes must be > 0")
+            }
         }
     }
 }
@@ -108,6 +130,59 @@ pub fn validate_trading_config(config: &TradingConfig) -> Result<(), Vec<ConfigV
             field: "session_end".into(),
             expected: "HH:MM".into(),
         });
+    }
+
+    // Event windows: validate each entry. Errors flow into the same vec
+    // so a single `validate_all` call surfaces every problem at once.
+    for event in &config.events {
+        if let Err(errs) = validate_event_window_config(event) {
+            errors.extend(errs);
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Validate a single event window config.
+///
+/// Rules:
+///   * Exactly one of `end` or `duration_minutes` must be set (not both,
+///     not neither).
+///   * `duration_minutes`, when set, must be > 0.
+///   * If `end` is set, it must be strictly after `start`.
+pub fn validate_event_window_config(
+    config: &EventWindowConfig,
+) -> Result<(), Vec<ConfigValidationError>> {
+    let mut errors = Vec::new();
+
+    match (config.end, config.duration_minutes) {
+        (Some(_), Some(_)) => {
+            errors.push(ConfigValidationError::EventWindowEndAndDurationConflict {
+                name: config.name.clone(),
+            });
+        }
+        (None, None) => {
+            errors.push(ConfigValidationError::EventWindowEndOrDurationRequired {
+                name: config.name.clone(),
+            });
+        }
+        (Some(end), None) => {
+            if end <= config.start {
+                errors.push(ConfigValidationError::EventWindowNonPositiveDuration {
+                    name: config.name.clone(),
+                });
+            }
+        }
+        (None, Some(0)) => {
+            errors.push(ConfigValidationError::EventWindowZeroDuration {
+                name: config.name.clone(),
+            });
+        }
+        (None, Some(_)) => {}
     }
 
     if errors.is_empty() {
@@ -234,6 +309,7 @@ mod tests {
             session_end: "16:00".into(),
             max_spread_threshold: FixedPrice::new(4),
             fee_schedule_date: chrono::Utc::now().date_naive(),
+            events: Vec::new(),
         }
     }
 
@@ -372,5 +448,196 @@ mod tests {
 
         let errs = validate_all(&trading, &fees, &broker).unwrap_err();
         assert!(errs.len() >= 4); // At least one from each config
+    }
+
+    // ----- Event window validation (story 5.5, task 1.4) -----
+
+    use crate::config::{EventAction, EventWindowConfig};
+    use chrono::NaiveDate;
+
+    fn duration_event(name: &str) -> EventWindowConfig {
+        EventWindowConfig {
+            name: name.into(),
+            start: NaiveDate::from_ymd_opt(2026, 4, 16)
+                .unwrap()
+                .and_hms_opt(14, 0, 0)
+                .unwrap(),
+            end: None,
+            duration_minutes: Some(120),
+            action: EventAction::SitOut,
+        }
+    }
+
+    fn end_event(name: &str) -> EventWindowConfig {
+        EventWindowConfig {
+            name: name.into(),
+            start: NaiveDate::from_ymd_opt(2026, 4, 16)
+                .unwrap()
+                .and_hms_opt(14, 0, 0)
+                .unwrap(),
+            end: Some(
+                NaiveDate::from_ymd_opt(2026, 4, 16)
+                    .unwrap()
+                    .and_hms_opt(15, 0, 0)
+                    .unwrap(),
+            ),
+            duration_minutes: None,
+            action: EventAction::DisableStrategies,
+        }
+    }
+
+    #[test]
+    fn event_window_with_duration_only_is_valid() {
+        assert!(validate_event_window_config(&duration_event("FOMC")).is_ok());
+    }
+
+    #[test]
+    fn event_window_with_end_only_is_valid() {
+        assert!(validate_event_window_config(&end_event("CPI")).is_ok());
+    }
+
+    #[test]
+    fn event_window_with_both_end_and_duration_rejected() {
+        let mut event = duration_event("FOMC");
+        event.end = Some(
+            NaiveDate::from_ymd_opt(2026, 4, 16)
+                .unwrap()
+                .and_hms_opt(16, 0, 0)
+                .unwrap(),
+        );
+        let errs = validate_event_window_config(&event).unwrap_err();
+        assert!(matches!(
+            &errs[0],
+            ConfigValidationError::EventWindowEndAndDurationConflict { name } if name == "FOMC"
+        ));
+    }
+
+    #[test]
+    fn event_window_with_neither_end_nor_duration_rejected() {
+        let mut event = duration_event("FOMC");
+        event.duration_minutes = None;
+        let errs = validate_event_window_config(&event).unwrap_err();
+        assert!(matches!(
+            &errs[0],
+            ConfigValidationError::EventWindowEndOrDurationRequired { name } if name == "FOMC"
+        ));
+    }
+
+    #[test]
+    fn event_window_with_zero_duration_rejected() {
+        let mut event = duration_event("FOMC");
+        event.duration_minutes = Some(0);
+        let errs = validate_event_window_config(&event).unwrap_err();
+        assert!(matches!(
+            &errs[0],
+            ConfigValidationError::EventWindowZeroDuration { name } if name == "FOMC"
+        ));
+    }
+
+    #[test]
+    fn event_window_with_end_before_start_rejected() {
+        let mut event = end_event("CPI");
+        event.end = Some(
+            NaiveDate::from_ymd_opt(2026, 4, 16)
+                .unwrap()
+                .and_hms_opt(13, 0, 0)
+                .unwrap(),
+        );
+        let errs = validate_event_window_config(&event).unwrap_err();
+        assert!(matches!(
+            &errs[0],
+            ConfigValidationError::EventWindowNonPositiveDuration { name } if name == "CPI"
+        ));
+    }
+
+    #[test]
+    fn event_window_with_end_equal_to_start_rejected() {
+        let mut event = end_event("CPI");
+        event.end = Some(event.start);
+        let errs = validate_event_window_config(&event).unwrap_err();
+        assert!(matches!(
+            &errs[0],
+            ConfigValidationError::EventWindowNonPositiveDuration { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_trading_config_includes_event_errors() {
+        let mut trading = valid_trading_config();
+        let mut bad = duration_event("Bad");
+        bad.duration_minutes = None;
+        trading.events.push(bad);
+        let errs = validate_trading_config(&trading).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ConfigValidationError::EventWindowEndOrDurationRequired { name } if name == "Bad"
+        )));
+    }
+
+    #[test]
+    fn event_action_deserialises_snake_case_strings() {
+        let toml = r#"
+            name = "FOMC"
+            start = "2026-04-16T14:00:00"
+            duration_minutes = 120
+            action = "sit_out"
+        "#;
+        let cfg: EventWindowConfig = toml::from_str(toml).expect("parse event window");
+        assert_eq!(cfg.name, "FOMC");
+        assert_eq!(cfg.action, EventAction::SitOut);
+        assert_eq!(cfg.duration_minutes, Some(120));
+        assert!(cfg.end.is_none());
+    }
+
+    #[test]
+    fn events_array_of_tables_in_trading_config_parses() {
+        let toml = r#"
+            symbol = "ES"
+            max_position_size = 2
+            max_daily_loss_ticks = 400
+            max_consecutive_losses = 3
+            max_trades_per_day = 30
+            edge_multiple_threshold = 1.5
+            session_start = "09:30"
+            session_end = "16:00"
+            max_spread_threshold = 4
+            fee_schedule_date = "2026-04-01"
+
+            [[events]]
+            name = "FOMC"
+            start = "2026-04-16T14:00:00"
+            duration_minutes = 120
+            action = "sit_out"
+
+            [[events]]
+            name = "CPI Release"
+            start = "2026-05-13T08:30:00"
+            duration_minutes = 30
+            action = "disable_strategies"
+        "#;
+        let cfg: TradingConfig = toml::from_str(toml).expect("parse trading config");
+        assert_eq!(cfg.events.len(), 2);
+        assert_eq!(cfg.events[0].name, "FOMC");
+        assert_eq!(cfg.events[0].action, EventAction::SitOut);
+        assert_eq!(cfg.events[1].name, "CPI Release");
+        assert_eq!(cfg.events[1].action, EventAction::DisableStrategies);
+    }
+
+    #[test]
+    fn missing_events_array_defaults_to_empty() {
+        let toml = r#"
+            symbol = "ES"
+            max_position_size = 2
+            max_daily_loss_ticks = 400
+            max_consecutive_losses = 3
+            max_trades_per_day = 30
+            edge_multiple_threshold = 1.5
+            session_start = "09:30"
+            session_end = "16:00"
+            max_spread_threshold = 4
+            fee_schedule_date = "2026-04-01"
+        "#;
+        let cfg: TradingConfig = toml::from_str(toml).expect("parse trading config");
+        assert!(cfg.events.is_empty());
     }
 }

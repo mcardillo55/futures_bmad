@@ -20,6 +20,7 @@
 #![deny(unsafe_code)]
 
 pub mod circuit_breakers;
+pub mod event_windows;
 pub mod fee_gate;
 pub mod panic_mode;
 
@@ -28,6 +29,7 @@ use std::fmt;
 use futures_bmad_core::BreakerType;
 
 pub use circuit_breakers::CircuitBreakers;
+pub use event_windows::{ActiveEvent, EventWindowManager, TradingRestriction};
 pub use fee_gate::{FeeGate, FeeGateReason};
 pub use panic_mode::{ActivationOutcome, OrderCancellation, PanicMode, PanicState};
 

@@ -526,6 +526,7 @@ mod tests {
             session_end: "16:00".into(),
             max_spread_threshold: FixedPrice::new(4),
             fee_schedule_date: chrono::Utc::now().date_naive(),
+            events: Vec::new(),
         }
     }
 

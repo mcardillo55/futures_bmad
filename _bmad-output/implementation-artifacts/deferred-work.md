@@ -70,3 +70,77 @@ Note: S-2 from this review (partial entry over-sizes SL/TP via warn-only) is the
 - N-6: `BracketManager::on_bracket_fill` computes `realized_pnl_quarter_ticks` independently of `Position::apply_fill`. When 8-2 wires the event loop to forward fills to both, double-counting/staleness ambiguity. Recommendation: doc comment on `FlattenOutcome::TakeProfit::realized_pnl_quarter_ticks` clarifying that `PositionTracker` is the canonical source of truth across a session and the bracket-scoped value is diagnostic. [`crates/engine/src/order_manager/bracket.rs:106-118`]
 - N-7: `BrokerPosition::side: Option<Side>` + `quantity: u32` (unsigned) means shorts are NOT represented as negative qty. This contradicts a common broker-API convention. Wire-up in OrderPlant integration must explicitly normalize. Worth a doc comment on `BrokerPosition::side`. [`crates/core/src/types/position.rs:147-160`]
 - N-8: `BrokerAdapter::query_positions -> Result<Vec<BrokerPosition>, BrokerError>` is implicitly all-or-nothing. If a broker can return positions for some symbols and fail for others, the wire-up code must turn that into either Ok(partial) (which silently omits symbols and triggers PhantomLocal) or Err. Document the all-or-nothing contract or evolve to `Result<HashMap<u32, Result<BrokerPosition, BrokerError>>, ...>`. [`crates/core/src/traits/broker.rs:36`]
+
+## Deferred from: code review of story-5.1 (2026-04-30)
+
+- [x] S-1: `DenialReason` numeric-context fields (`daily_loss_current`, `consecutive_loss_count`, `requested_position_size`, `fee_days_stale`, `buffer_occupancy_pct`) initialized to zero with no public setter. **Resolved organically in story-5.2:** the four new entry points (`check_position_size`, `update_daily_loss`, `record_trade_result`, `record_trade`) update the cached fields BEFORE the trip check.
+- S-2: `GateConditions::default()` silently auto-clears all gates by setting all dual-source booleans to `false`. Test fixtures that construct `GateConditions { fee_schedule_stale: true, ..Default::default() }` will inadvertently clear the buffer/data-quality gates. Recommendation: either remove the `Default` impl or rename to make the auto-clear semantics explicit. [`crates/engine/src/risk/circuit_breakers.rs`]
+- S-3: `reset_breaker` does not emit a `CircuitBreakerEvent` on Tripped → Active transitions. Manual resets create an audit gap — the journal records the trip but not the reset. Violates the Epic 4 team agreement "every state transition is journaled." [`crates/engine/src/risk/circuit_breakers.rs`]
+- S-4: `CircuitBreakers::new` does not assert config validity (no `debug_assert!` matching `validate_trading_config`). Test fixtures bypassing validation will produce a breaker with broken thresholds without warning. Add a debug_assert at construction. [`crates/engine/src/risk/circuit_breakers.rs`]
+- N-1 through N-7: doc-drift and naming inconsistencies (e.g., `requested_position_size` field actually holds current position; `EventAction::severity` is dead code). Track when standardizing trip semantics (see 5-2 S-1 below).
+
+## Deferred from: code review of story-5.2 (2026-04-30)
+
+- S-1: Inconsistent trip semantics across the four breakers — `>=` for position size and consecutive losses, `>` for max trades, `<= -limit` for daily loss. Implementation matches each task's literal text; AC-level wording is loose. Standardize when adding the next breaker variant. [`crates/engine/src/risk/circuit_breakers.rs`]
+- S-2: `update_daily_loss(session_cumulative)` doc says "session-cumulative, NOT delta" but the API silently overwrites if deltas arrive. Either tighten the type (newtype `SessionCumulativeLossTicks`) or add a runtime check (`debug_assert` that the value is monotonically nonincreasing during a losing run). [`crates/engine/src/risk/circuit_breakers.rs`]
+- S-3 (carryforward into 8-2): Task 5 marked "wired into event loop" with the explanation "API surface must be callable" — the actual call site does not exist. Belongs to story 8-2 (event-loop assembly) along with 5.1 framework wiring. [`crates/engine/src/event_loop.rs`]
+- N-1 through N-6: minor doc clarifications and edge-case test coverage gaps.
+
+## Deferred from: code review of story-5.3 (2026-04-30)
+
+- **B-1 (LIVE-TRADING EXIT GATE; close before Epic 6):** `CircuitBreakers` has no `panic_mode: bool` field; `permits_trading()` does not consult panic mode; no `DenialReason::PanicModeActive` variant. Two parallel "can we trade?" gates exist (`CircuitBreakers::permits_trading` and `PanicMode::is_trading_enabled`) and every order-submission path must remember to check both. AC for "Task 5: CircuitBreakers integration with panic mode" not satisfied. [`crates/engine/src/risk/circuit_breakers.rs`, `crates/engine/src/risk/panic_mode.rs`]
+- **B-2 (LIVE-TRADING EXIT GATE; close before Epic 6):** `check_position_anomaly` and `handle_anomaly` have NO production caller. `handle_anomaly` is documented as "intended to be `tokio::spawn`-ed onto the broker runtime" but the spawn never happens. AC for "Given position outside active strategy context When detected Then anomalous position breaker activates, automated flatten submitted" is not satisfied at integration level. [`crates/engine/src/risk/anomaly_handler.rs`]
+- S-1: `flatten_failure_activates_panic_mode_with_context` test was relaxed during rebase — no longer asserts the journal `SystemEvent` carries "attempt 1/2/3" detail. Detail flows through operator-alert channel (5.6) instead. Document the assertion split or restore the journal assertion. [`crates/engine/src/risk/anomaly_handler.rs`]
+- N-1 through N-4: rebase-induced test coverage gaps and minor doc-drift.
+
+## Deferred from: code review of story-5.4 (2026-04-30)
+
+- **P1 (LIVE-TRADING EXIT GATE; close before Epic 6):** Task 3.6 not executed — `fee_gate.rs` is unchanged. Two parallel fee-staleness implementations exist: `FeeGate::permits_trade` does its own `>60 days` check returning `FeeGateReason::StaleSchedule`, and the new `CircuitBreakers::check_fee_staleness` does the same against its own state. Nothing reconciles them. Pick one canonical owner; delete the other path or have it forward to the canonical one. [`crates/engine/src/risk/fee_gate.rs`, `crates/engine/src/risk/circuit_breakers.rs`]
+- D1: `permits_trading()` vs `permits_trade_evaluation()` have identical signatures, distinguished only by docstring severity. The split-API contract lives entirely in tests and docstrings — no consumer outside the risk module invokes either. Decide before story 8-2 wiring whether to (a) keep docstring-only, (b) tag intent via parameter (`intent: TradeIntent`), or (c) return a tagged type. [`crates/engine/src/risk/circuit_breakers.rs`]
+- P2/P3/P4: minor patches (logging cleanup, test naming, edge-case coverage). Apply in a focused follow-up commit.
+- W1–W4: defer items (forward-looking caveats and pre-existing concerns).
+
+## Deferred from: code review of story-5.5 (2026-04-30)
+
+- S-1: `EventWindowManager::new` silently filters out malformed configs (defense-in-depth, correct design) but a test fixture that constructs `TradingConfig` directly (bypassing `validate_trading_config`) will produce a manager with `len() == 0` with no warning. Add a `debug_assert!` matching the validate function at construction time. [`crates/engine/src/risk/event_windows.rs`]
+- S-2: TOML event-time strings parse via RFC3339 but the validation does not explicitly require a timezone offset. A naive timestamp could be mis-interpreted depending on parser behavior. Document required format with examples; consider explicit TZ enforcement. [`crates/core/src/config/validation.rs`]
+- S-3: Two parallel severity tables — `EventAction::severity` in core (`crates/core/src/config/trading.rs`) and `TradingRestriction::severity` in engine (`crates/engine/src/risk/event_windows.rs`). Identical match arms, no parity test. Will drift if either side adds a variant. Add a parity test or unify on one source. [`crates/core/src/config/trading.rs`, `crates/engine/src/risk/event_windows.rs`]
+- N-1 through N-6: minor — `current_trading_restriction()` doc says "call once per evaluation pass" but API can't enforce; minor allocation in repeated-call path; doc and naming clarifications.
+
+## Deferred from: code review of story-5.6 (2026-04-30)
+
+- D1: Per-alert script thread spawn is unbounded above the channel cap. Healthy operation never hits the bound (V1 alerts are rare — non-resetting breakers with idempotent re-trips), but a misconfigured script (sleeps, hangs without honoring SIGTERM) plus an alert burst could spawn many concurrent threads. Decide whether to bound script-thread concurrency in V1 or defer to ops-level supervision. Becomes more pressing if Epic 6 regime-transition alerts are added. [`crates/engine/src/risk/alerting.rs`]
+- P1: Silent failure to spawn alert-script thread (`thread::Builder::spawn` returns `Err` swallowed). Log on spawn failure. [`crates/engine/src/risk/alerting.rs`]
+- P2: Timeout test does not actually assert the child process was killed on timeout — passes even if `child.kill()` is a no-op. [`crates/engine/src/risk/alerting.rs` (test)]
+- P3: Redundant clone of `Option<PositionSnapshot>` in `circuit_breakers.rs:391`. Trivial. [`crates/engine/src/risk/circuit_breakers.rs`]
+- W1: `fsync-per-write` throughput ceiling is invisible to future maintainers. Document the assumption (V1 alerts are rare) so future extensions to per-tick alerting know to revisit.
+- W2: `BreakerKind::PanicMode` is constructible only via the panic alert path — slightly awkward but intentional. Document.
+- W3: `child.kill()` does not kill the script's own children. Documented as ops responsibility. [`crates/engine/src/risk/alerting.rs`]
+- N1 (dismissed): `PositionSnapshot::flat_unknown()` is an intentional placeholder, not a "lying" value. Handled at use site.
+
+## Deferred from: story-5.x rebase integration (2026-04-30)
+
+- **Worktree-merge-at-end pattern produced partially-stale integration code.** Stories 5.2–5.6 were developed in parallel worktrees, several rooted on pre-5.1 main. Story 5.3 explicitly: *"developed against a stale main (pre-5.1 merge) and surgically rebased into the post-5.1+5.2+5.4+5.6 framework on integration."* Tasks were checked ✅ in worktrees against the stub framework but the rebase didn't carry integration wiring forward against the new framework. **Resolution:** Action item P-1 in epic-5-retro-2026-05-01.md — framework-first merge order with integrators rebasing onto merged main BEFORE declaring tasks done. In effect for Epic 6 onward.
+
+---
+
+## Live-Trading Exit Gates
+
+**Purpose:** Single index of all open items that block enabling live trading. Updated at every story review. Reviewed at every retro. Story 8.2 startup sequence MUST verify ALL items closed before enabling live-trading mode.
+
+**Convention:** items are tracked in their original `## Deferred from:` section (with full context). This section is an INDEX that points back. To resolve: close in the original section by marking `[x]`, then mark resolved here.
+
+| ID | Source | Severity | Description | Target |
+|---|---|---|---|---|
+| 4-5 S-1 | story-4.5 review | HIGH | In-flight-fill / broker-query reconciliation race; periodic reconciliation will trip on this during fill bursts | Story 8.2 (lifecycle/startup, periodic reconciliation wire-up) |
+| 4-5 S-2 | story-4.5 review | HIGH | `trading_halted` flag set by reconciliation mismatch but never consulted by `OrderManager::submit_order` | Wire via Epic 5 CircuitBreaker framework — partially addressed by Story 5.1 (framework exists) but call-site wiring still pending Story 8.2 |
+| 4-5 S-3 / 4-3 S-2 / 4-4 S-2 | story-4.5 review | HIGH | Partial-entry SL/TP oversizing in `BracketManager::on_entry_fill`; Buy-5 partial-filled-3 → SL fires at 5 → flatten 3 + naked short 2 (NFR16 violation) | Panic-mode escalation pending; Story 5.3 framework exists but partial-entry trigger not wired |
+| **5-3 B-1** | story-5.3 review | HIGH | `CircuitBreakers::permits_trading()` doesn't consult panic mode; no `DenialReason::PanicModeActive` variant; two parallel "can we trade?" gates | **Pre-Epic-6 cleanup commit** |
+| **5-3 B-2** | story-5.3 review | HIGH | `check_position_anomaly` / `handle_anomaly` have no production caller — anomaly detection AC not satisfied at integration level | **Pre-Epic-6 cleanup commit** |
+| **5-4 P1** | story-5.4 review | HIGH | Fee-staleness duplicated between `FeeGate::permits_trade` and `CircuitBreakers::check_fee_staleness`; no reconciliation | **Pre-Epic-6 cleanup commit** |
+
+**Total open: 6 items.**
+- 3 carried from Epic 4 (target: Story 8.2)
+- 3 introduced by Epic 5 (target: pre-Epic-6 cleanup commit, per Epic 5 retro action items D-1, D-2, D-3)
+
+**Resolution discipline:** when closing, update the original `## Deferred from:` section with `[x]` and a one-line resolution note (commit hash if applicable). Then mark resolved here. DO NOT silently delete entries.

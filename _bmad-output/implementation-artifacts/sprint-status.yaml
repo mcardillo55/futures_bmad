@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-16
-last_updated: 2026-04-30  # story 5-1 ready for review
+last_updated: 2026-05-01  # epic 5 retrospective completed
 project: futures_bmad
 project_key: NOKEY
 tracking_system: file-system
@@ -81,14 +81,14 @@ development_status:
   epic-4-retrospective: done
 
   # Epic 5: Risk Management & Circuit Breakers
-  epic-5: in-progress
-  5-1-circuit-breaker-framework: review
-  5-2-position-and-loss-limit-breakers: review
-  5-3-anomalous-position-detection-and-panic-mode: review
-  5-4-infrastructure-breakers: review
-  5-5-event-aware-trading-windows: review
-  5-6-operator-alerting-on-circuit-breaker-events: review
-  epic-5-retrospective: optional
+  epic-5: done
+  5-1-circuit-breaker-framework: done
+  5-2-position-and-loss-limit-breakers: done
+  5-3-anomalous-position-detection-and-panic-mode: done
+  5-4-infrastructure-breakers: done
+  5-5-event-aware-trading-windows: done
+  5-6-operator-alerting-on-circuit-breaker-events: done
+  epic-5-retrospective: done
 
   # Epic 6: Regime Detection & Strategy Orchestration
   epic-6: in-progress

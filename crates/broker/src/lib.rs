@@ -17,5 +17,6 @@ pub use order_routing::{
     route_pending_orders,
 };
 pub use position_flatten::{
-    FLATTEN_MAX_ATTEMPTS, FLATTEN_RETRY_INTERVAL, FlattenOutcome, FlattenRequest, FlattenRetry,
+    FLATTEN_MAX_ATTEMPTS, FLATTEN_RETRY_INTERVAL, FlattenError, FlattenOutcome, FlattenRequest,
+    FlattenRetry, PositionFlattener,
 };

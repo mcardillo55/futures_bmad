@@ -28,6 +28,7 @@
 #![deny(unsafe_code)]
 
 pub mod alerting;
+pub mod anomaly_handler;
 pub mod circuit_breakers;
 pub mod event_windows;
 pub mod fee_gate;
@@ -42,7 +43,8 @@ pub use alerting::{
     BreakerKind, DEFAULT_SCRIPT_TIMEOUT, FlattenAttemptDetail, PositionSnapshot,
     SharedAlertSender, alert_channel,
 };
-pub use circuit_breakers::{CircuitBreakers, ConnectionState};
+pub use anomaly_handler::{AnomalyResolution, handle_anomaly};
+pub use circuit_breakers::{AnomalyCheckOutcome, CircuitBreakers, ConnectionState};
 pub use event_windows::{ActiveEvent, EventWindowManager, TradingRestriction};
 pub use fee_gate::{FeeGate, FeeGateReason};
 pub use panic_mode::{ActivationOutcome, OrderCancellation, PanicContext, PanicMode, PanicState};

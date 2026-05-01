@@ -66,6 +66,20 @@ pub enum ConnectionState {
     CircuitBreak,
 }
 
+/// Story 5.3 — outcome of [`CircuitBreakers::check_position_anomaly`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnomalyCheckOutcome {
+    /// Position matches the active strategy expectation. No action taken.
+    Consistent,
+    /// Position lies outside any active strategy context — the
+    /// `AnomalousPosition` breaker has been tripped (manual reset only) and
+    /// the caller should engage the flatten path.
+    Anomalous {
+        current_position: i32,
+        strategy_expected_position: i32,
+    },
+}
+
 /// Sliding-window threshold for malformed Rithmic messages — `>10` arrivals
 /// in any 60s window trips the malformed-messages breaker (architecture
 /// spec, Implementation Specifications).
@@ -813,6 +827,48 @@ impl CircuitBreakers {
     #[doc(hidden)]
     pub fn trade_count(&self) -> u32 {
         self.trade_count
+    }
+
+    // ---------------------------------------------------------------
+    // Story 5.3 — anomalous-position detection
+    // ---------------------------------------------------------------
+
+    /// Detect a position that lies outside any active strategy context.
+    ///
+    /// `current_position` is the engine's net signed position for the symbol
+    /// (positive long, negative short). `strategy_expected_position` is the
+    /// sum of every active strategy's expected position; callers pass `0`
+    /// when no strategy currently claims this symbol.
+    ///
+    /// Detection rules (per Story 5.3 ACs):
+    ///   - Both flat ⇒ `Consistent`.
+    ///   - Both equal ⇒ `Consistent` (strategy owns the position).
+    ///   - Otherwise ⇒ `Anomalous`, trips the
+    ///     [`BreakerType::AnomalousPosition`] breaker, journals a
+    ///     `CircuitBreakerEvent` with the position delta in the reason
+    ///     string. Manual reset only.
+    pub fn check_position_anomaly(
+        &mut self,
+        symbol_id: u32,
+        current_position: i32,
+        strategy_expected_position: i32,
+        timestamp: UnixNanos,
+    ) -> AnomalyCheckOutcome {
+        if current_position == strategy_expected_position {
+            return AnomalyCheckOutcome::Consistent;
+        }
+        let delta = current_position.saturating_sub(strategy_expected_position);
+        let reason = format!(
+            "anomalous position on symbol {symbol_id}: current={current_position} \
+             strategy_expected={strategy_expected_position} delta={delta}"
+        );
+        if matches!(self.anomalous_position_state, BreakerState::Active) {
+            self.trip_breaker(BreakerType::AnomalousPosition, reason, timestamp);
+        }
+        AnomalyCheckOutcome::Anomalous {
+            current_position,
+            strategy_expected_position,
+        }
     }
 
     // -------------------------------------------------------------------

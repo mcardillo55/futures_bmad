@@ -36,6 +36,21 @@ use tracing::{error, info, warn};
 
 use crate::order_routing::{OrderSubmitter, SubmissionError};
 
+/// Story 5.3 Task 2.4: structured error type returned by the flatten
+/// orchestrator's [`PositionFlattener::flatten`] method.
+///
+/// `FlattenError::OrderRejected` describes a single attempt's failure (used
+/// by callers that want to log per-attempt rejection reasons themselves);
+/// `FlattenError::AllAttemptsFailed` is the terminal escalation signal —
+/// the engine's panic-mode policy MUST fire on this variant.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FlattenError {
+    #[error("flatten attempt {attempt} rejected: {reason}")]
+    OrderRejected { attempt: u8, reason: String },
+    #[error("all flatten attempts failed ({} total)", attempts.len())]
+    AllAttemptsFailed { attempts: Vec<String> },
+}
+
 /// Total flatten attempts before declaring failure (per architecture spec
 /// "Flatten retry count + interval | 3 attempts, 1s between").
 pub const FLATTEN_MAX_ATTEMPTS: u8 = 3;
@@ -192,7 +207,90 @@ impl<'a, S: OrderSubmitter + ?Sized> FlattenRetry<'a, S> {
             last_error,
         }
     }
+
+    /// Story 5.3 Task 2.2-2.5: `Result<(), FlattenError>` view of the retry
+    /// loop.
+    ///
+    /// Identical mechanics to [`FlattenRetry::flatten_with_retry`], but
+    /// returns `Ok(())` on success and `Err(FlattenError::AllAttemptsFailed
+    /// { attempts })` when every attempt exhausts. The `attempts` vec carries
+    /// each attempt's rejection reason so the engine's panic-mode wiring can
+    /// build a `PanicContext` with the full per-attempt history.
+    pub async fn flatten(&self, req: FlattenRequest) -> Result<(), FlattenError> {
+        let event = OrderEvent {
+            order_id: req.order_id,
+            symbol_id: req.symbol_id,
+            side: req.side,
+            quantity: req.quantity,
+            order_type: OrderType::Market,
+            decision_id: req.decision_id,
+            timestamp: req.timestamp,
+        };
+
+        // Per-attempt rejection reasons captured for the AllAttemptsFailed
+        // payload. Allocated up-front at the spec'd max_attempts capacity so
+        // we never grow the vec on the retry hot path.
+        let mut attempts: Vec<String> = Vec::with_capacity(self.max_attempts as usize);
+        for attempt in 1..=self.max_attempts {
+            info!(
+                target: "flatten_retry",
+                order_id = req.order_id,
+                decision_id = req.decision_id,
+                attempt,
+                max_attempts = self.max_attempts,
+                "submitting flatten market order"
+            );
+            match self.submitter.submit_order(&event).await {
+                Ok(()) => {
+                    info!(
+                        target: "flatten_retry",
+                        order_id = req.order_id,
+                        decision_id = req.decision_id,
+                        attempts = attempt,
+                        "flatten submission accepted"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    let reason = err.to_string();
+                    warn!(
+                        target: "flatten_retry",
+                        order_id = req.order_id,
+                        decision_id = req.decision_id,
+                        symbol_id = req.symbol_id,
+                        attempt,
+                        max_attempts = self.max_attempts,
+                        error = %err,
+                        "flatten submission rejected"
+                    );
+                    attempts.push(reason);
+                    if attempt < self.max_attempts {
+                        tokio::time::sleep(self.retry_interval).await;
+                    }
+                }
+            }
+        }
+
+        error!(
+            target: "flatten_retry",
+            order_id = req.order_id,
+            decision_id = req.decision_id,
+            symbol_id = req.symbol_id,
+            attempts = self.max_attempts,
+            "flatten retry exhausted — caller must engage panic mode"
+        );
+        Err(FlattenError::AllAttemptsFailed { attempts })
+    }
 }
+
+/// Story 5.3 Task 2.1: re-export of [`FlattenRetry`] under the spec name
+/// `PositionFlattener`.
+///
+/// `FlattenRetry` is the real type (introduced in Story 4.3); `PositionFlattener`
+/// is the alias the Story 5.3 acceptance criteria mention. New callers should
+/// prefer `PositionFlattener::flatten` which returns the structured
+/// [`FlattenError`] payload required by the engine-side panic-mode wiring.
+pub type PositionFlattener<'a, S> = FlattenRetry<'a, S>;
 
 #[cfg(test)]
 mod tests {
@@ -329,5 +427,56 @@ mod tests {
         assert_eq!(evt.quantity, 5);
         assert_eq!(evt.order_id, 42);
         assert_eq!(evt.decision_id, 7);
+    }
+
+    // ------------------------------------------------------------------
+    // Story 5.3 Task 2 — `Result<(), FlattenError>` shape tests
+    // ------------------------------------------------------------------
+
+    /// Task 6.4 — `flatten()` returns `Ok(())` when the first attempt fills.
+    #[tokio::test]
+    async fn flatten_result_ok_on_first_attempt_success() {
+        let submitter = ScriptedSubmitter::new(0, SubmissionError::Unknown);
+        let retry = PositionFlattener::new(&submitter);
+        let outcome = retry.flatten(req()).await;
+        assert!(matches!(outcome, Ok(())));
+        assert_eq!(submitter.attempts(), 1);
+    }
+
+    /// Task 6.3 / 6.5 — `flatten()` retries up to 3 attempts; returns
+    /// `AllAttemptsFailed` carrying the per-attempt rejection reasons.
+    #[tokio::test]
+    async fn flatten_result_returns_all_attempts_failed_after_three_rejections() {
+        let submitter = ScriptedSubmitter::new(10, SubmissionError::ExchangeReject);
+        let retry = PositionFlattener::new(&submitter)
+            .with_retry_interval(Duration::from_millis(1));
+
+        let outcome = retry.flatten(req()).await;
+        match outcome {
+            Err(FlattenError::AllAttemptsFailed { attempts }) => {
+                assert_eq!(attempts.len(), FLATTEN_MAX_ATTEMPTS as usize);
+                for reason in &attempts {
+                    assert!(
+                        reason.to_lowercase().contains("reject")
+                            || reason.contains("ExchangeReject"),
+                        "unexpected reason: {reason}"
+                    );
+                }
+            }
+            other => panic!("expected AllAttemptsFailed, got {other:?}"),
+        }
+        assert_eq!(submitter.attempts(), FLATTEN_MAX_ATTEMPTS as u32);
+    }
+
+    /// Task 6.3 — retry path is exercised: first two attempts fail, third
+    /// succeeds, returns `Ok(())`.
+    #[tokio::test]
+    async fn flatten_result_ok_after_retries() {
+        let submitter = ScriptedSubmitter::new(2, SubmissionError::ConnectionLost);
+        let retry = PositionFlattener::new(&submitter)
+            .with_retry_interval(Duration::from_millis(1));
+        let outcome = retry.flatten(req()).await;
+        assert!(matches!(outcome, Ok(())));
+        assert_eq!(submitter.attempts(), 3);
     }
 }

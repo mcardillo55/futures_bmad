@@ -9,6 +9,7 @@ pub mod ingest;
 pub mod order_book;
 pub mod order_manager;
 pub mod persistence;
+pub mod regime;
 pub mod replay;
 pub mod risk;
 pub mod signals;

@@ -26,3 +26,4 @@ futures_bmad_testkit = { workspace = true }
 tempfile = "3"
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+toml = { workspace = true }

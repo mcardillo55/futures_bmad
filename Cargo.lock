@@ -743,6 +743,7 @@ dependencies = [
  "thiserror",
  "tikv-jemallocator",
  "tokio",
+ "toml",
  "tracing",
 ]
 

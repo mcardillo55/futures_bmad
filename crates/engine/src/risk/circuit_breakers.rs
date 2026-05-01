@@ -35,17 +35,52 @@
 #![deny(unsafe_code)]
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use chrono::NaiveDate;
 use crossbeam_channel::{Sender, TrySendError};
 use futures_bmad_core::{
     BreakerCategory, BreakerState, BreakerType, CircuitBreakerEvent, OrderEvent, OrderType,
     TradingConfig, UnixNanos,
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use super::alerting::{Alert, AlertSender, PositionSnapshot};
 use super::{DenialReason, TradingDenied};
+
+/// Reconnection FSM state surfaced by `engine/src/connection/fsm.rs`.
+///
+/// Story 5.4 only needs to react to the [`ConnectionState::CircuitBreak`]
+/// terminal state — entered when reconciliation fails (timeout or position
+/// mismatch). All other states are transient and do not trip the
+/// connection-failure breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConnectionState {
+    /// Connected and reconciled — normal operation.
+    Connected,
+    /// Disconnected, attempting reconnect.
+    Reconnecting,
+    /// Reconnected, replaying broker state.
+    Reconciling,
+    /// Reconciliation failed — manual intervention required.
+    CircuitBreak,
+}
+
+/// Sliding-window threshold for malformed Rithmic messages — `>10` arrivals
+/// in any 60s window trips the malformed-messages breaker (architecture
+/// spec, Implementation Specifications).
+const MALFORMED_WINDOW: Duration = Duration::from_secs(60);
+const MALFORMED_THRESHOLD: usize = 10;
+
+/// Buffer-occupancy thresholds for the tiered SPSC saturation response.
+const BUFFER_WARN_PCT: f32 = 50.0;
+const BUFFER_GATE_PCT: f32 = 80.0;
+const BUFFER_BREAK_PCT: f32 = 95.0;
+const BUFFER_FULL_PCT: f32 = 100.0;
+
+/// Fee schedule staleness threshold (days). Anything strictly greater than
+/// this trips the fee-staleness gate.
+const FEE_STALENESS_DAYS: i64 = 60;
 
 /// Per-state tracking for the ten breakers / gates.
 ///
@@ -87,11 +122,23 @@ pub struct CircuitBreakers {
     max_position_size_limit: u32,
     fee_days_stale: i64,
     buffer_occupancy_pct: f32,
-    /// Sliding window of recent malformed-message arrivals; the
-    /// malformed-messages breaker (story 5.4) populates this. Carried
-    /// here so the framework owns the state, but the breaker logic
-    /// itself is the future story's responsibility.
+    /// Capacity of the SPSC buffer the framework is monitoring. Captured
+    /// from `update_buffer_occupancy` calls so the 100%-full log line can
+    /// report absolute counts, not just the percentage.
+    buffer_capacity: usize,
+    /// Sliding window of recent malformed-message arrivals; populated by
+    /// `record_malformed_message`. Front-pruned to the most recent 60s
+    /// window on each call, so `len()` is the live count.
     pub malformed_window: VecDeque<Instant>,
+
+    /// Whether the buffer-high condition (>=80%) is active. The
+    /// `data_quality_state` slot is shared between buffer pressure and
+    /// data-quality issues; tracking these as separate sources lets the
+    /// gate auto-clear only when BOTH have resolved.
+    buffer_high_condition: bool,
+    /// Whether a data-quality issue (`!is_tradeable`, gap, stale) is
+    /// active. Counterpart to `buffer_high_condition`.
+    data_quality_condition: bool,
 
     /// Free-form context fields populated by trip sites — included in
     /// denial-reason display strings.
@@ -141,7 +188,10 @@ impl CircuitBreakers {
             max_position_size_limit: config.max_position_size,
             fee_days_stale: 0,
             buffer_occupancy_pct: 0.0,
+            buffer_capacity: 0,
             malformed_window: VecDeque::new(),
+            buffer_high_condition: false,
+            data_quality_condition: false,
 
             anomalous_position_detail: String::new(),
             connection_failure_detail: String::new(),
@@ -165,23 +215,29 @@ impl CircuitBreakers {
     /// All breakers green ⇒ `Ok(())` without allocation. Otherwise returns
     /// the full set of denial reasons.
     ///
+    /// Trade-evaluation-only gates (today: `FeeStaleness`) are deliberately
+    /// excluded from this check — see [`permits_trade_evaluation`]. This
+    /// is the gate safety / flatten orders go through, so a stale fee
+    /// schedule never blocks a stop-loss or panic-mode flatten.
+    ///
     /// `#[inline]` because this sits on the per-tick hot path and the
-    /// happy path collapses to a single boolean reduction over ten
+    /// happy path collapses to a single boolean reduction over nine
     /// `BreakerState::Active` checks.
     #[inline]
     pub fn permits_trading(&self) -> Result<(), TradingDenied> {
-        // Happy-path early-out: bitwise reduction over ten enum equalities,
+        // Happy-path early-out: bitwise reduction over nine enum equalities,
         // no allocation, no branching beyond the AND chain.
-        if self.all_active() {
+        if self.all_active_excluding_eval_only() {
             return Ok(());
         }
-        Err(self.collect_denials())
+        Err(self.collect_denials_excluding_eval_only())
     }
 
-    /// Whether every breaker / gate is currently `Active`. Pure read,
-    /// kept inline so `permits_trading()` collapses to a single boolean.
+    /// Whether every non-eval-only breaker / gate is currently `Active`.
+    /// Pure read, kept inline so `permits_trading()` collapses to a single
+    /// boolean.
     #[inline]
-    fn all_active(&self) -> bool {
+    fn all_active_excluding_eval_only(&self) -> bool {
         matches!(self.daily_loss_state, BreakerState::Active)
             && matches!(self.consecutive_losses_state, BreakerState::Active)
             && matches!(self.max_trades_state, BreakerState::Active)
@@ -191,6 +247,14 @@ impl CircuitBreakers {
             && matches!(self.malformed_messages_state, BreakerState::Active)
             && matches!(self.max_position_size_state, BreakerState::Active)
             && matches!(self.data_quality_state, BreakerState::Active)
+        // FeeStaleness intentionally excluded — see permits_trading docs.
+    }
+
+    /// Whether every breaker / gate (including eval-only) is currently
+    /// `Active`. Used by `permits_trade_evaluation`.
+    #[inline]
+    fn all_active(&self) -> bool {
+        self.all_active_excluding_eval_only()
             && matches!(self.fee_staleness_state, BreakerState::Active)
     }
 
@@ -253,6 +317,17 @@ impl CircuitBreakers {
             });
         }
         TradingDenied { reasons }
+    }
+
+    /// Like `collect_denials` but omits the eval-only `FeeStaleness`
+    /// gate. Used by `permits_trading()` so safety / flatten orders are
+    /// never blocked by a stale fee schedule.
+    fn collect_denials_excluding_eval_only(&self) -> TradingDenied {
+        let mut denied = self.collect_denials();
+        denied
+            .reasons
+            .retain(|r| r.breaker_type() != BreakerType::FeeStaleness);
+        denied
     }
 
     /// Trip a breaker or gate.
@@ -739,6 +814,286 @@ impl CircuitBreakers {
     pub fn trade_count(&self) -> u32 {
         self.trade_count
     }
+
+    // -------------------------------------------------------------------
+    // Story 5.4 — infrastructure breakers.
+    //
+    // The methods below implement the five infrastructure-level safety
+    // checks that catch system-state problems (queue saturation,
+    // degraded data, stale fee schedules, malformed feed messages,
+    // failed reconnects). They share the existing per-breaker state
+    // machine (trip / gate-clear / manual-reset) introduced by
+    // story 5.1; their job is to translate raw input signals into the
+    // appropriate trip / clear actions.
+    // -------------------------------------------------------------------
+
+    /// Update the buffer-occupancy metric and trip / clear the tiered
+    /// response.
+    ///
+    /// Tier table (architecture spec, SPSC Buffer Strategy):
+    ///   * `>= 50%` — log warning (no breaker / gate action)
+    ///   * `>= 80%` — trip the [`BreakerType::DataQuality`] gate (auto-clears
+    ///     when occupancy falls below 80% AND no other data-quality fault
+    ///     is active). Trade evaluation is paused but the engine continues
+    ///     consuming events to drain the queue.
+    ///   * `>= 95%` — trip the [`BreakerType::BufferOverflow`] breaker
+    ///     (manual reset). Distinct from the 80% gate — both states can be
+    ///     active simultaneously.
+    ///   * `>= 100%` — log the saturation explicitly at `error!` level and
+    ///     trip the BufferOverflow breaker (covers the 95% path with an
+    ///     explicit "never silently drop" guarantee).
+    ///
+    /// `current_len` is the number of slots currently in use; `capacity`
+    /// is the total queue size. Both are passed in so the framework is
+    /// not tied to the SPSC implementation.
+    pub fn update_buffer_occupancy(
+        &mut self,
+        current_len: usize,
+        capacity: usize,
+        timestamp: UnixNanos,
+    ) {
+        // Defensive: a zero-capacity queue would yield NaN/Inf percentage.
+        // Treat it as unmonitored — log once at error level and bail.
+        if capacity == 0 {
+            error!(
+                target: "circuit_breakers",
+                "buffer occupancy update with capacity=0 — ignored"
+            );
+            return;
+        }
+        self.buffer_capacity = capacity;
+        let pct = (current_len as f32 / capacity as f32) * 100.0;
+        self.buffer_occupancy_pct = pct;
+
+        // Tier 4: 100% full — explicit log, never silent. The 95% breaker
+        // path also fires below; this branch is the audit-trail guarantee
+        // that we never drop without explicit notice.
+        if pct >= BUFFER_FULL_PCT {
+            error!(
+                target: "circuit_breakers",
+                occupancy_pct = pct,
+                current_len,
+                capacity,
+                "SPSC buffer 100% full — events will be dropped, tripping BufferOverflow"
+            );
+        }
+
+        // Tier 3: 95% — trip the BufferOverflow breaker (manual reset).
+        if pct >= BUFFER_BREAK_PCT
+            && matches!(self.buffer_overflow_state, BreakerState::Active)
+        {
+            self.trip_breaker(
+                BreakerType::BufferOverflow,
+                format!("buffer occupancy {pct:.1}% reached 95% threshold"),
+                timestamp,
+            );
+        }
+
+        // Tier 2: 80% — trip the DataQuality gate due to buffer pressure.
+        // The DataQuality gate slot is shared with the data-quality
+        // sources (Task 2); we track the buffer-high condition separately
+        // so the gate auto-clears only when both sources are clear.
+        if pct >= BUFFER_GATE_PCT {
+            if !self.buffer_high_condition {
+                self.buffer_high_condition = true;
+                if matches!(self.data_quality_state, BreakerState::Active) {
+                    self.trip_breaker(
+                        BreakerType::DataQuality,
+                        format!("buffer occupancy {pct:.1}% reached 80% threshold"),
+                        timestamp,
+                    );
+                }
+            }
+        } else if self.buffer_high_condition {
+            // Buffer pressure resolved.
+            self.buffer_high_condition = false;
+            self.maybe_clear_data_quality_gate(timestamp);
+        }
+
+        // Tier 1: 50% — warning only.
+        if (BUFFER_WARN_PCT..BUFFER_GATE_PCT).contains(&pct) {
+            warn!(
+                target: "circuit_breakers",
+                occupancy_pct = pct,
+                current_len,
+                capacity,
+                "SPSC buffer >=50% occupancy"
+            );
+        }
+    }
+
+    /// Update the data-quality state from order-book / feed signals.
+    ///
+    /// Any of the three flags being "bad" (`!is_tradeable`, `has_gap`,
+    /// `is_stale`) trips the [`BreakerType::DataQuality`] gate. When all
+    /// three flags clear AND no buffer-pressure source remains, the gate
+    /// auto-clears.
+    pub fn update_data_quality(
+        &mut self,
+        is_tradeable: bool,
+        has_gap: bool,
+        is_stale: bool,
+        timestamp: UnixNanos,
+    ) {
+        let bad = !is_tradeable || has_gap || is_stale;
+        if bad {
+            if !self.data_quality_condition {
+                self.data_quality_condition = true;
+                if matches!(self.data_quality_state, BreakerState::Active) {
+                    let detail = format!(
+                        "is_tradeable={is_tradeable} has_gap={has_gap} is_stale={is_stale}",
+                    );
+                    self.trip_breaker(BreakerType::DataQuality, detail, timestamp);
+                }
+            }
+        } else if self.data_quality_condition {
+            self.data_quality_condition = false;
+            self.maybe_clear_data_quality_gate(timestamp);
+        }
+    }
+
+    /// Helper used by both buffer-pressure and data-quality clear paths:
+    /// auto-clear the DataQuality gate only when neither source remains
+    /// active. Idempotent.
+    fn maybe_clear_data_quality_gate(&mut self, timestamp: UnixNanos) {
+        if !self.buffer_high_condition
+            && !self.data_quality_condition
+            && matches!(self.data_quality_state, BreakerState::Tripped)
+        {
+            // `clear_gate` is the canonical path — emits the duration log
+            // and audit-trail event.
+            if let Err(e) = self.clear_gate(BreakerType::DataQuality, timestamp) {
+                warn!(target: "circuit_breakers", error = ?e, "data_quality clear_gate failed");
+            }
+        }
+    }
+
+    /// Check the fee-schedule staleness gate.
+    ///
+    /// `current_date - fee_schedule_date > 60 days` ⇒ trip the
+    /// [`BreakerType::FeeStaleness`] gate. When the difference falls back
+    /// to ≤60 days (e.g. operator pushed a fresh config), the gate
+    /// auto-clears.
+    ///
+    /// CRITICAL: the FeeStaleness gate ONLY blocks trade evaluation. Use
+    /// [`CircuitBreakers::permits_trade_evaluation`] for entry decisions
+    /// and the regular [`CircuitBreakers::permits_trading`] (which
+    /// excludes FeeStaleness) for safety / flatten orders. See the
+    /// distinction enforced in `permits_trade_evaluation` below.
+    pub fn check_fee_staleness(
+        &mut self,
+        fee_schedule_date: NaiveDate,
+        current_date: NaiveDate,
+        timestamp: UnixNanos,
+    ) {
+        let days_old = (current_date - fee_schedule_date).num_days();
+        self.fee_days_stale = days_old;
+
+        if days_old > FEE_STALENESS_DAYS {
+            if matches!(self.fee_staleness_state, BreakerState::Active) {
+                self.trip_breaker(
+                    BreakerType::FeeStaleness,
+                    format!("fee schedule {days_old} days stale (threshold {FEE_STALENESS_DAYS})"),
+                    timestamp,
+                );
+            }
+        } else if matches!(self.fee_staleness_state, BreakerState::Tripped) {
+            // Operator pushed a fresh config — auto-clear.
+            if let Err(e) = self.clear_gate(BreakerType::FeeStaleness, timestamp) {
+                warn!(target: "circuit_breakers", error = ?e, "fee_staleness clear_gate failed");
+            }
+        }
+    }
+
+    /// Strict variant of `permits_trading` for trade-evaluation decisions
+    /// (signal → entry-order pipeline).
+    ///
+    /// Returns `Err` if any of the nine `permits_trading()` breakers /
+    /// gates have tripped *or* the FeeStaleness gate is tripped. Safety /
+    /// flatten orders MUST use `permits_trading()` — they are NEVER
+    /// blocked by the FeeStaleness gate (an open position with a stale
+    /// fee schedule still needs its stop honored).
+    ///
+    /// `#[inline]` because the entry-order decision pipeline is also
+    /// hot-path; the happy-path short-circuits to `Ok(())` without
+    /// allocation.
+    #[inline]
+    pub fn permits_trade_evaluation(&self) -> Result<(), TradingDenied> {
+        if self.all_active() {
+            return Ok(());
+        }
+        Err(self.collect_denials())
+    }
+
+    /// Record a malformed Rithmic message arrival.
+    ///
+    /// Maintains a sliding 60-second window via front-pruning of the
+    /// internal `VecDeque<Instant>`. When the window holds more than 10
+    /// entries (i.e. 11+ malformed arrivals in any 60s span), trips the
+    /// [`BreakerType::MalformedMessages`] breaker (manual reset).
+    ///
+    /// Note: individual malformed messages are already logged and skipped
+    /// upstream by `broker/src/message_validator.rs` — this breaker
+    /// detects the *pattern* that the feed is corrupt enough to warrant
+    /// pulling the trading plug.
+    pub fn record_malformed_message(&mut self, timestamp: Instant, journal_ts: UnixNanos) {
+        // Front-prune entries older than 60s.
+        let cutoff = timestamp.checked_sub(MALFORMED_WINDOW);
+        if let Some(cutoff) = cutoff {
+            while let Some(&front) = self.malformed_window.front() {
+                if front < cutoff {
+                    self.malformed_window.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.malformed_window.push_back(timestamp);
+
+        if self.malformed_window.len() > MALFORMED_THRESHOLD
+            && matches!(self.malformed_messages_state, BreakerState::Active)
+        {
+            let count = self.malformed_window.len();
+            self.trip_breaker(
+                BreakerType::MalformedMessages,
+                format!("{count} malformed messages in 60s window (threshold {MALFORMED_THRESHOLD})"),
+                journal_ts,
+            );
+        }
+    }
+
+    /// React to a reconnection-FSM state transition.
+    ///
+    /// Only the [`ConnectionState::CircuitBreak`] state trips the
+    /// [`BreakerType::ConnectionFailure`] breaker (manual reset). The
+    /// breaker is appropriate, not a gate, because in-flight broker state
+    /// may be corrupt after a failed reconciliation — the operator must
+    /// confirm the world is consistent before resuming.
+    pub fn on_connection_state_change(
+        &mut self,
+        new_state: ConnectionState,
+        timestamp: UnixNanos,
+    ) {
+        if matches!(new_state, ConnectionState::CircuitBreak)
+            && matches!(self.connection_failure_state, BreakerState::Active)
+        {
+            self.trip_breaker(
+                BreakerType::ConnectionFailure,
+                "reconnection FSM entered CircuitBreak".to_string(),
+                timestamp,
+            );
+        }
+    }
+
+    /// Read the current buffer occupancy percentage. Test/observability.
+    pub fn buffer_occupancy_pct(&self) -> f32 {
+        self.buffer_occupancy_pct
+    }
+
+    /// Read the current malformed-window length. Test/observability.
+    pub fn malformed_window_len(&self) -> usize {
+        self.malformed_window.len()
+    }
 }
 
 /// Per-tick gate evaluation snapshot. Stories 5.2–5.6 produce this from
@@ -1146,6 +1501,204 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // Story 5.4 — infrastructure breaker tests (Task 7).
+    //
+    // Each test maps 1:1 to a subtask in Task 7 of the story.
+    // -------------------------------------------------------------------
+
+    const CAPACITY: usize = 1000;
+    fn drain(rx: &Receiver<CircuitBreakerEvent>) -> Vec<CircuitBreakerEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// 7.1 — buffer overflow breaker trips at 95%, distinct from 80% gate.
+    #[test]
+    fn buffer_overflow_at_95_distinct_from_80_gate() {
+        let (mut cb, rx) = fixture();
+        // Cross 95% — this also crosses 80%, so BOTH should activate
+        // simultaneously per the AC.
+        cb.update_buffer_occupancy(950, CAPACITY, UnixNanos::new(1));
+
+        assert_eq!(cb.state(BreakerType::BufferOverflow), BreakerState::Tripped);
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Tripped);
+
+        let events = drain(&rx);
+        // Two trips: BufferOverflow + DataQuality (in this order via
+        // update_buffer_occupancy: 95% block runs first, then 80% block).
+        let kinds: Vec<_> = events.iter().map(|e| e.breaker_type).collect();
+        assert!(kinds.contains(&BreakerType::BufferOverflow));
+        assert!(kinds.contains(&BreakerType::DataQuality));
+    }
+
+    /// 7.2 — 80% buffer gate auto-clears when occupancy drops below 80%.
+    #[test]
+    fn buffer_80_gate_auto_clears_below_threshold() {
+        let (mut cb, _rx) = fixture();
+        // Cross 80% (but not 95%) so only the gate trips.
+        cb.update_buffer_occupancy(820, CAPACITY, UnixNanos::new(1));
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Tripped);
+        assert_eq!(cb.state(BreakerType::BufferOverflow), BreakerState::Active);
+
+        // Drop below 80% — gate auto-clears.
+        cb.update_buffer_occupancy(700, CAPACITY, UnixNanos::new(2));
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Active);
+    }
+
+    /// 7.3 — 100% full triggers immediate circuit break with explicit log.
+    /// We can't capture the tracing output without a subscriber; we
+    /// instead verify the breaker IS tripped at 100%, satisfying the
+    /// "never silently drop" requirement at the API level.
+    #[test]
+    fn buffer_100_percent_circuit_breaks() {
+        let (mut cb, _rx) = fixture();
+        cb.update_buffer_occupancy(CAPACITY, CAPACITY, UnixNanos::new(1));
+        assert_eq!(cb.state(BreakerType::BufferOverflow), BreakerState::Tripped);
+        assert!((cb.buffer_occupancy_pct() - 100.0).abs() < 1e-3);
+    }
+
+    /// 7.4 — data-quality gate trips on `!is_tradeable`, auto-clears on restore.
+    #[test]
+    fn data_quality_gate_trips_on_not_tradeable_and_clears() {
+        let (mut cb, _rx) = fixture();
+        cb.update_data_quality(false, false, false, UnixNanos::new(1));
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Tripped);
+
+        cb.update_data_quality(true, false, false, UnixNanos::new(2));
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Active);
+    }
+
+    /// 7.5 — data-quality gate trips on stale data, clears on fresh data.
+    #[test]
+    fn data_quality_gate_trips_on_stale_and_clears() {
+        let (mut cb, _rx) = fixture();
+        cb.update_data_quality(true, false, true, UnixNanos::new(1));
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Tripped);
+
+        cb.update_data_quality(true, false, false, UnixNanos::new(2));
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Active);
+    }
+
+    /// 7.5b — data-quality gate trips on sequence gap (separate to 7.5).
+    #[test]
+    fn data_quality_gate_trips_on_gap_and_clears() {
+        let (mut cb, _rx) = fixture();
+        cb.update_data_quality(true, true, false, UnixNanos::new(1));
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Tripped);
+
+        cb.update_data_quality(true, false, false, UnixNanos::new(2));
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Active);
+    }
+
+    /// 7.6 — fee staleness gate trips at 61 days, NOT at 60 days.
+    #[test]
+    fn fee_staleness_threshold_at_61_days_not_60() {
+        let (mut cb, _rx) = fixture();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+
+        // 60 days back — boundary, must NOT trip.
+        let sched_60 = today - chrono::Duration::days(60);
+        cb.check_fee_staleness(sched_60, today, UnixNanos::new(1));
+        assert_eq!(
+            cb.state(BreakerType::FeeStaleness),
+            BreakerState::Active,
+            "60 days must not trip (threshold is >60)"
+        );
+
+        // 61 days back — must trip.
+        let sched_61 = today - chrono::Duration::days(61);
+        cb.check_fee_staleness(sched_61, today, UnixNanos::new(2));
+        assert_eq!(cb.state(BreakerType::FeeStaleness), BreakerState::Tripped);
+    }
+
+    /// 7.6b — fee staleness gate auto-clears when config is freshened.
+    #[test]
+    fn fee_staleness_auto_clears_on_fresh_config() {
+        let (mut cb, _rx) = fixture();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+
+        let sched_old = today - chrono::Duration::days(90);
+        cb.check_fee_staleness(sched_old, today, UnixNanos::new(1));
+        assert_eq!(cb.state(BreakerType::FeeStaleness), BreakerState::Tripped);
+
+        // Fresh config (today's date) — gate auto-clears.
+        cb.check_fee_staleness(today, today, UnixNanos::new(2));
+        assert_eq!(cb.state(BreakerType::FeeStaleness), BreakerState::Active);
+    }
+
+    /// 7.7 — fee staleness gate does NOT block safety/flatten orders;
+    /// `permits_trading()` (the safety-permitting check) returns Ok even
+    /// when FeeStaleness is tripped, while `permits_trade_evaluation()`
+    /// rejects it.
+    #[test]
+    fn fee_staleness_blocks_eval_only_not_safety() {
+        let (mut cb, _rx) = fixture();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let sched_old = today - chrono::Duration::days(90);
+        cb.check_fee_staleness(sched_old, today, UnixNanos::new(1));
+
+        // Safety / flatten path — must be permitted.
+        assert!(cb.permits_trading().is_ok());
+
+        // Trade-evaluation path — must be denied with FeeStaleness reason.
+        let denied = cb.permits_trade_evaluation().unwrap_err();
+        assert!(denied.contains(BreakerType::FeeStaleness));
+    }
+
+    /// 7.8 — malformed-message sliding window prunes entries older than 60s.
+    #[test]
+    fn malformed_window_prunes_old_entries() {
+        let (mut cb, _rx) = fixture();
+        let t0 = Instant::now();
+
+        // First arrival.
+        cb.record_malformed_message(t0, UnixNanos::new(1));
+        assert_eq!(cb.malformed_window_len(), 1);
+
+        // Arrival 61 seconds later — the t0 entry must be pruned, leaving
+        // only the new one.
+        let t1 = t0 + Duration::from_secs(61);
+        cb.record_malformed_message(t1, UnixNanos::new(2));
+        assert_eq!(
+            cb.malformed_window_len(),
+            1,
+            "old entry must be pruned outside 60s window"
+        );
+    }
+
+    /// 7.9 — malformed-message breaker trips at 11th message within 60s window.
+    #[test]
+    fn malformed_breaker_trips_on_eleventh_in_window() {
+        let (mut cb, _rx) = fixture();
+        let t0 = Instant::now();
+
+        // 10 arrivals — must NOT trip (threshold is `>10`).
+        for i in 0..10u64 {
+            cb.record_malformed_message(
+                t0 + Duration::from_millis(i * 100),
+                UnixNanos::new(i),
+            );
+        }
+        assert_eq!(
+            cb.state(BreakerType::MalformedMessages),
+            BreakerState::Active
+        );
+
+        // 11th arrival — must trip.
+        cb.record_malformed_message(
+            t0 + Duration::from_millis(1100),
+            UnixNanos::new(99),
+        );
+        assert_eq!(
+            cb.state(BreakerType::MalformedMessages),
+            BreakerState::Tripped
+        );
+    }
+
     /// `update_gate_conditions(...)` continues to integrate with the
     /// max-position-size gate when callers pre-evaluate the condition
     /// themselves (the framework's pre-existing API surface).
@@ -1307,6 +1860,183 @@ mod tests {
         assert_eq!(cb.consecutive_loss_count(), 1);
         assert_eq!(
             cb.state(BreakerType::ConsecutiveLosses),
+            BreakerState::Active
+        );
+    }
+
+    /// 7.10 — malformed breaker does NOT trip when 10 messages spread over >60s.
+    #[test]
+    fn malformed_breaker_no_trip_when_spread_over_window() {
+        let (mut cb, _rx) = fixture();
+        let t0 = Instant::now();
+
+        // 11 arrivals, each 7 seconds apart — total 70s span. Window is
+        // 60s, so no point in time has more than ~9 in window.
+        for i in 0..11u64 {
+            cb.record_malformed_message(
+                t0 + Duration::from_secs(i * 7),
+                UnixNanos::new(i),
+            );
+            assert_eq!(
+                cb.state(BreakerType::MalformedMessages),
+                BreakerState::Active,
+                "iteration {i}: must not trip when spread"
+            );
+        }
+    }
+
+    /// 7.11 — connection failure breaker trips on CircuitBreak FSM state.
+    #[test]
+    fn connection_failure_trips_on_circuit_break_state() {
+        let (mut cb, _rx) = fixture();
+
+        // Benign transitions are no-ops.
+        cb.on_connection_state_change(ConnectionState::Reconnecting, UnixNanos::new(1));
+        cb.on_connection_state_change(ConnectionState::Reconciling, UnixNanos::new(2));
+        cb.on_connection_state_change(ConnectionState::Connected, UnixNanos::new(3));
+        assert_eq!(
+            cb.state(BreakerType::ConnectionFailure),
+            BreakerState::Active
+        );
+
+        // CircuitBreak trips the breaker.
+        cb.on_connection_state_change(ConnectionState::CircuitBreak, UnixNanos::new(4));
+        assert_eq!(
+            cb.state(BreakerType::ConnectionFailure),
+            BreakerState::Tripped
+        );
+    }
+
+    /// 7.12 — all infrastructure breakers can coexist (multi-trip).
+    #[test]
+    fn all_infrastructure_breakers_coexist() {
+        let (mut cb, _rx) = fixture();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let t0 = Instant::now();
+
+        // Trip BufferOverflow + DataQuality (95%).
+        cb.update_buffer_occupancy(950, CAPACITY, UnixNanos::new(1));
+        // Trip data-quality with explicit fault (additional source).
+        cb.update_data_quality(false, true, true, UnixNanos::new(2));
+        // Trip FeeStaleness (90 days).
+        let sched_old = today - chrono::Duration::days(90);
+        cb.check_fee_staleness(sched_old, today, UnixNanos::new(3));
+        // Trip MalformedMessages (11 in window).
+        for i in 0..11 {
+            cb.record_malformed_message(
+                t0 + Duration::from_millis(i * 100),
+                UnixNanos::new(i + 4),
+            );
+        }
+        // Trip ConnectionFailure.
+        cb.on_connection_state_change(ConnectionState::CircuitBreak, UnixNanos::new(20));
+
+        // All five infrastructure breakers / gates tripped simultaneously.
+        assert_eq!(cb.state(BreakerType::BufferOverflow), BreakerState::Tripped);
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Tripped);
+        assert_eq!(cb.state(BreakerType::FeeStaleness), BreakerState::Tripped);
+        assert_eq!(
+            cb.state(BreakerType::MalformedMessages),
+            BreakerState::Tripped
+        );
+        assert_eq!(
+            cb.state(BreakerType::ConnectionFailure),
+            BreakerState::Tripped
+        );
+
+        // Trade-evaluation must be denied with all five reasons present.
+        let denied = cb.permits_trade_evaluation().unwrap_err();
+        assert!(denied.contains(BreakerType::BufferOverflow));
+        assert!(denied.contains(BreakerType::DataQuality));
+        assert!(denied.contains(BreakerType::FeeStaleness));
+        assert!(denied.contains(BreakerType::MalformedMessages));
+        assert!(denied.contains(BreakerType::ConnectionFailure));
+
+        // permits_trading() denies all but FeeStaleness.
+        let denied_safety = cb.permits_trading().unwrap_err();
+        assert!(denied_safety.contains(BreakerType::BufferOverflow));
+        assert!(denied_safety.contains(BreakerType::DataQuality));
+        assert!(!denied_safety.contains(BreakerType::FeeStaleness));
+        assert!(denied_safety.contains(BreakerType::MalformedMessages));
+        assert!(denied_safety.contains(BreakerType::ConnectionFailure));
+    }
+
+    /// Edge: data-quality gate stays tripped while buffer-pressure source
+    /// remains active. Verifies the dual-source auto-clear logic.
+    #[test]
+    fn data_quality_gate_dual_source_auto_clear() {
+        let (mut cb, _rx) = fixture();
+
+        // Trip via buffer pressure first.
+        cb.update_buffer_occupancy(820, CAPACITY, UnixNanos::new(1));
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Tripped);
+
+        // Add a separate data-quality fault.
+        cb.update_data_quality(false, false, false, UnixNanos::new(2));
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Tripped);
+
+        // Clear buffer pressure — gate must STAY tripped (data-quality
+        // source still active).
+        cb.update_buffer_occupancy(500, CAPACITY, UnixNanos::new(3));
+        assert_eq!(
+            cb.state(BreakerType::DataQuality),
+            BreakerState::Tripped,
+            "gate must remain tripped while data-quality source is active"
+        );
+
+        // Clear data-quality fault — gate auto-clears (no sources active).
+        cb.update_data_quality(true, false, false, UnixNanos::new(4));
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Active);
+    }
+
+    /// Edge: 95% breaker is manual-reset; tripping persists across
+    /// further `update_buffer_occupancy` calls even when occupancy
+    /// recedes.
+    #[test]
+    fn buffer_overflow_breaker_requires_manual_reset() {
+        let (mut cb, _rx) = fixture();
+        cb.update_buffer_occupancy(960, CAPACITY, UnixNanos::new(1));
+        assert_eq!(cb.state(BreakerType::BufferOverflow), BreakerState::Tripped);
+
+        // Drain back down — breaker must NOT auto-clear.
+        cb.update_buffer_occupancy(100, CAPACITY, UnixNanos::new(2));
+        assert_eq!(cb.state(BreakerType::BufferOverflow), BreakerState::Tripped);
+
+        // Manual reset clears it.
+        cb.reset_breaker(BreakerType::BufferOverflow);
+        assert_eq!(cb.state(BreakerType::BufferOverflow), BreakerState::Active);
+    }
+
+    /// Edge: malformed-messages breaker is manual-reset; once tripped, an
+    /// idle 60s+ window does not bring it back.
+    #[test]
+    fn malformed_breaker_requires_manual_reset() {
+        let (mut cb, _rx) = fixture();
+        let t0 = Instant::now();
+        for i in 0..11 {
+            cb.record_malformed_message(
+                t0 + Duration::from_millis(i * 100),
+                UnixNanos::new(i),
+            );
+        }
+        assert_eq!(
+            cb.state(BreakerType::MalformedMessages),
+            BreakerState::Tripped
+        );
+
+        // Window goes idle — but breaker stays tripped.
+        cb.record_malformed_message(
+            t0 + Duration::from_secs(120),
+            UnixNanos::new(99),
+        );
+        assert_eq!(
+            cb.state(BreakerType::MalformedMessages),
+            BreakerState::Tripped
+        );
+
+        cb.reset_breaker(BreakerType::MalformedMessages);
+        assert_eq!(
+            cb.state(BreakerType::MalformedMessages),
             BreakerState::Active
         );
     }
@@ -1525,5 +2255,55 @@ mod tests {
         // arithmetic clamps to i64::MIN which is well past any realistic cap.
         cb.update_daily_loss(i64::MIN, i64::MIN, UnixNanos::new(1));
         assert_eq!(cb.state(BreakerType::DailyLoss), BreakerState::Tripped);
+    }
+
+    /// Edge: connection-failure breaker is manual-reset; subsequent
+    /// `Connected` transitions don't clear it.
+    #[test]
+    fn connection_failure_breaker_requires_manual_reset() {
+        let (mut cb, _rx) = fixture();
+        cb.on_connection_state_change(ConnectionState::CircuitBreak, UnixNanos::new(1));
+        assert_eq!(
+            cb.state(BreakerType::ConnectionFailure),
+            BreakerState::Tripped
+        );
+
+        cb.on_connection_state_change(ConnectionState::Connected, UnixNanos::new(2));
+        assert_eq!(
+            cb.state(BreakerType::ConnectionFailure),
+            BreakerState::Tripped
+        );
+
+        cb.reset_breaker(BreakerType::ConnectionFailure);
+        assert_eq!(
+            cb.state(BreakerType::ConnectionFailure),
+            BreakerState::Active
+        );
+    }
+
+    /// Edge: zero-capacity buffer update is a no-op (defensive guard).
+    #[test]
+    fn buffer_occupancy_zero_capacity_is_noop() {
+        let (mut cb, _rx) = fixture();
+        cb.update_buffer_occupancy(0, 0, UnixNanos::new(1));
+        // No state change, no panic.
+        assert_eq!(cb.state(BreakerType::BufferOverflow), BreakerState::Active);
+        assert_eq!(cb.state(BreakerType::DataQuality), BreakerState::Active);
+    }
+
+    /// Edge: hot-path discipline — `permits_trade_evaluation` short-circuits
+    /// on the happy path just like `permits_trading`.
+    #[test]
+    fn permits_trade_evaluation_fast_on_happy_path() {
+        let (cb, _rx) = fixture();
+        let start = std::time::Instant::now();
+        for _ in 0..100_000 {
+            let _ = cb.permits_trade_evaluation();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 100,
+            "permits_trade_evaluation too slow: {elapsed:?}"
+        );
     }
 }

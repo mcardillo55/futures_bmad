@@ -85,7 +85,7 @@ development_status:
   5-1-circuit-breaker-framework: review
   5-2-position-and-loss-limit-breakers: review
   5-3-anomalous-position-detection-and-panic-mode: ready-for-dev
-  5-4-infrastructure-breakers: ready-for-dev
+  5-4-infrastructure-breakers: review
   5-5-event-aware-trading-windows: review
   5-6-operator-alerting-on-circuit-breaker-events: review
   epic-5-retrospective: optional

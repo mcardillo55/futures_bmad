@@ -1,6 +1,7 @@
 // futures_bmad_engine: Trading engine, signal processing, and strategy orchestration.
 
 pub mod buffer_monitor;
+pub mod connection;
 pub mod data;
 pub mod data_quality;
 pub mod event_loop;

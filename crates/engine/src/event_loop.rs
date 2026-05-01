@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use futures_bmad_core::{Clock, EventWindowConfig, OrderBook};
+use futures_bmad_core::{Clock, EventWindowConfig, FixedPrice, OrderBook, UnixNanos};
 use tracing::info;
 
 use crate::buffer_monitor::{BufferMonitor, BufferState};
@@ -9,11 +9,21 @@ use crate::data_quality::{
     DataQualityGate, GateReason, GateState, SequenceGapDetector, StaleDataDetector,
 };
 use crate::order_book::apply_market_event;
-use crate::risk::{EventWindowManager, TradingRestriction};
+use crate::risk::{CircuitBreakers, EventWindowManager, TradingRestriction};
 use crate::spsc::MarketEventConsumer;
 
 /// How often to check for stale data (in loop iterations).
 const STALE_CHECK_INTERVAL: u64 = 1000;
+
+/// Default max-spread threshold used by the order book's
+/// `is_tradeable()` check inside the event loop. Set when
+/// `CircuitBreakers` wiring is attached; the value is the production
+/// trading config's `max_spread_threshold` and is supplied by the
+/// caller via `attach_circuit_breakers`.
+#[derive(Debug, Clone, Copy)]
+struct BookGuards {
+    max_spread: FixedPrice,
+}
 
 /// Hot-path event loop that consumes MarketEvents from SPSC and updates OrderBook.
 /// Runs on a dedicated pinned core. Never allocates after initialization.
@@ -36,6 +46,15 @@ pub struct EventLoop<C: Clock> {
     events_processed: u64,
     tick_count: u64,
     running: Arc<AtomicBool>,
+    /// Optional wiring into the unified circuit-breaker framework.
+    /// Story 5.4 plumbs the buffer-occupancy and data-quality signals
+    /// into [`CircuitBreakers`] when this is `Some`. When `None`, the
+    /// legacy [`BufferMonitor`] / [`DataQualityGate`] paths still run
+    /// untouched (used by the existing tests).
+    breakers: Option<CircuitBreakers>,
+    /// Captured guards for the breaker plumbing — currently just the
+    /// max-spread threshold used by `OrderBook::is_tradeable()`.
+    book_guards: Option<BookGuards>,
 }
 
 /// Handle for stopping the event loop from another thread.
@@ -78,7 +97,42 @@ impl<C: Clock> EventLoop<C> {
             events_processed: 0,
             tick_count: 0,
             running: Arc::new(AtomicBool::new(false)),
+            breakers: None,
+            book_guards: None,
         }
+    }
+
+    /// Attach a [`CircuitBreakers`] instance so this event loop drives the
+    /// unified breaker framework (story 5.4). When attached, every tick
+    /// will:
+    ///
+    ///   * call `update_buffer_occupancy` with the consumer's current
+    ///     length and capacity (Task 6.1)
+    ///   * call `update_data_quality` after each order-book update with
+    ///     the live `is_tradeable()` / gap / staleness flags (Task 6.2)
+    ///
+    /// `max_spread` is the [`FixedPrice`] threshold used by
+    /// `OrderBook::is_tradeable()` — supplied here so the breaker plumbing
+    /// has the production trading-config value without the event loop
+    /// needing to own a full [`futures_bmad_core::TradingConfig`].
+    pub fn attach_circuit_breakers(
+        &mut self,
+        breakers: CircuitBreakers,
+        max_spread: FixedPrice,
+    ) {
+        self.breakers = Some(breakers);
+        self.book_guards = Some(BookGuards { max_spread });
+    }
+
+    /// Read access to the wired-in circuit-breaker framework, when present.
+    pub fn breakers(&self) -> Option<&CircuitBreakers> {
+        self.breakers.as_ref()
+    }
+
+    /// Mutable read access. Tests / wiring code use this to manually
+    /// trip / reset breakers during the lifetime of the event loop.
+    pub fn breakers_mut(&mut self) -> Option<&mut CircuitBreakers> {
+        self.breakers.as_mut()
     }
 
     /// Get a handle that can stop the event loop from another thread.
@@ -119,12 +173,23 @@ impl<C: Clock> EventLoop<C> {
     pub fn tick(&mut self) -> BufferState {
         self.tick_count += 1;
 
-        // Check buffer state
+        // Check buffer state (legacy monitor — retained for back-compat).
         let fill = self.consumer.fill_fraction();
         let state = self.monitor.update(fill);
 
+        // Story 5.4 wiring (Task 6.1): drive the unified circuit-breaker
+        // framework's buffer-occupancy check from the same SPSC stats.
+        if let Some(breakers) = self.breakers.as_mut() {
+            let used = self.consumer.available();
+            let capacity = self.consumer.capacity();
+            breakers.update_buffer_occupancy(used, capacity, self.clock.now());
+        }
+
         // Pop and process event
+        let mut event_processed_this_tick = false;
+        let mut had_seq_gap = false;
         if let Some(event) = self.consumer.try_pop() {
+            event_processed_this_tick = true;
             let _now = event.timestamp.as_nanos();
 
             // Update order book regardless of gate state
@@ -141,6 +206,7 @@ impl<C: Clock> EventLoop<C> {
                 .seq_detector
                 .check_sequence(event.symbol_id, event.sequence);
             if let Some((expected, received)) = seq_gap {
+                had_seq_gap = true;
                 self.gate.activate(
                     &GateReason::SequenceGap {
                         symbol_id: event.symbol_id,
@@ -162,6 +228,30 @@ impl<C: Clock> EventLoop<C> {
             }
         }
 
+        // Story 5.4 wiring (Task 6.2): after the order-book update,
+        // refresh the data-quality gate from the live book + stale/gap
+        // signals. Only run when an event was actually processed this
+        // tick — otherwise we'd flap the gate based on a stale view of
+        // the book.
+        if event_processed_this_tick
+            && let (Some(breakers), Some(guards)) =
+                (self.breakers.as_mut(), self.book_guards)
+        {
+            let wall_now = self.clock.now().as_nanos();
+            let market_open = self.clock.is_market_open();
+            let is_stale = self
+                .stale_detector
+                .check_stale(wall_now, market_open)
+                .is_some();
+            let is_tradeable = self.book.is_tradeable(guards.max_spread);
+            breakers.update_data_quality(
+                is_tradeable,
+                had_seq_gap,
+                is_stale,
+                self.clock.now(),
+            );
+        }
+
         // Periodic stale check (every N iterations) to detect silence
         if self.tick_count.is_multiple_of(STALE_CHECK_INTERVAL) {
             let now = self.clock.now().as_nanos();
@@ -169,10 +259,37 @@ impl<C: Clock> EventLoop<C> {
             if let Some(gap_nanos) = self.stale_detector.check_stale(now, market_open) {
                 self.gate
                     .activate(&GateReason::StaleData { gap_nanos }, now);
+                // Mirror into the breaker framework as well.
+                if let (Some(breakers), Some(guards)) =
+                    (self.breakers.as_mut(), self.book_guards)
+                {
+                    let is_tradeable = self.book.is_tradeable(guards.max_spread);
+                    let _ = gap_nanos; // surface; structure is logged by gate.activate
+                    breakers.update_data_quality(
+                        is_tradeable,
+                        false,
+                        true,
+                        self.clock.now(),
+                    );
+                }
             }
         }
 
         state
+    }
+
+    /// Tick-time fee-staleness check. Story 5.4 task 6.3 says this should
+    /// be invoked once per minute (not per tick) — callers schedule it
+    /// from a timer thread or the periodic-task scheduler.
+    pub fn check_fee_staleness(
+        &mut self,
+        fee_schedule_date: chrono::NaiveDate,
+        current_date: chrono::NaiveDate,
+        timestamp: UnixNanos,
+    ) {
+        if let Some(breakers) = self.breakers.as_mut() {
+            breakers.check_fee_staleness(fee_schedule_date, current_date, timestamp);
+        }
     }
 
     pub fn order_book(&self) -> &OrderBook {
@@ -442,5 +559,120 @@ mod tests {
             event_loop.current_trading_restriction(),
             Some(TradingRestriction::SitOut)
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Story 5.4 — wiring tests for the unified circuit-breaker framework.
+    //
+    // These cover Task 6: each tick must drive
+    // `update_buffer_occupancy` (Task 6.1) and `update_data_quality`
+    // (Task 6.2) on the attached `CircuitBreakers`.
+    // -------------------------------------------------------------------
+
+    use crate::risk::CircuitBreakers;
+    use crossbeam_channel::unbounded;
+    use futures_bmad_core::{BreakerState, BreakerType, TradingConfig};
+
+    fn breakers_for_test() -> CircuitBreakers {
+        let cfg = TradingConfig {
+            symbol: "ES".into(),
+            max_position_size: 2,
+            max_daily_loss_ticks: 1000,
+            max_consecutive_losses: 3,
+            max_trades_per_day: 30,
+            edge_multiple_threshold: 1.5,
+            session_start: "09:30".into(),
+            session_end: "16:00".into(),
+            max_spread_threshold: FixedPrice::new(4),
+            fee_schedule_date: chrono::Utc::now().date_naive(),
+            events: Vec::new(),
+        };
+        let (tx, _rx) = unbounded();
+        CircuitBreakers::new(&cfg, tx)
+    }
+
+    #[test]
+    fn breakers_buffer_occupancy_drives_data_quality_gate_at_80_pct() {
+        // Capacity 16 ⇒ 13 events = 81.25% which crosses the 80% gate but
+        // stays below the 95% breaker.
+        let (mut producer, consumer) = market_event_queue(16);
+        let clock = SimClock::new(BASE_TS);
+        let mut ev = EventLoop::new(consumer, clock, 3.0);
+        ev.attach_circuit_breakers(breakers_for_test(), FixedPrice::new(4));
+
+        for i in 0..13 {
+            producer.try_push(make_bid(18000 + i, 10, BASE_TS));
+        }
+
+        ev.tick();
+        let breakers = ev.breakers().unwrap();
+        assert_eq!(
+            breakers.state(BreakerType::DataQuality),
+            BreakerState::Tripped,
+            "80% buffer should trip DataQuality gate"
+        );
+        assert_eq!(
+            breakers.state(BreakerType::BufferOverflow),
+            BreakerState::Active,
+            "BufferOverflow should NOT trip below 95%"
+        );
+    }
+
+    #[test]
+    fn breakers_buffer_occupancy_drives_buffer_overflow_at_95_pct() {
+        // Capacity 32 ⇒ 31 events = 96.875% (≥95%, also ≥80%).
+        let (mut producer, consumer) = market_event_queue(32);
+        let clock = SimClock::new(BASE_TS);
+        let mut ev = EventLoop::new(consumer, clock, 3.0);
+        ev.attach_circuit_breakers(breakers_for_test(), FixedPrice::new(4));
+
+        for i in 0..31 {
+            producer.try_push(make_bid(18000 + i, 10, BASE_TS));
+        }
+
+        ev.tick();
+        let breakers = ev.breakers().unwrap();
+        assert_eq!(
+            breakers.state(BreakerType::BufferOverflow),
+            BreakerState::Tripped
+        );
+        assert_eq!(
+            breakers.state(BreakerType::DataQuality),
+            BreakerState::Tripped,
+            "95% also trips the 80% gate (both states must coexist)"
+        );
+    }
+
+    #[test]
+    fn breakers_check_fee_staleness_passthrough() {
+        let (_producer, consumer) = market_event_queue(16);
+        let clock = SimClock::new(BASE_TS);
+        let mut ev = EventLoop::new(consumer, clock, 3.0);
+        ev.attach_circuit_breakers(breakers_for_test(), FixedPrice::new(4));
+
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let stale = today - chrono::Duration::days(90);
+        ev.check_fee_staleness(stale, today, UnixNanos::new(1));
+
+        let breakers = ev.breakers().unwrap();
+        assert_eq!(
+            breakers.state(BreakerType::FeeStaleness),
+            BreakerState::Tripped
+        );
+    }
+
+    #[test]
+    fn breakers_disabled_when_not_attached() {
+        // Without `attach_circuit_breakers`, the loop runs as before with
+        // no breaker side effects.
+        let (mut producer, consumer) = market_event_queue(16);
+        let clock = SimClock::new(BASE_TS);
+        let mut ev = EventLoop::new(consumer, clock, 3.0);
+
+        for i in 0..13 {
+            producer.try_push(make_bid(18000 + i, 10, BASE_TS));
+        }
+        ev.tick();
+        assert!(ev.breakers().is_none());
     }
 }

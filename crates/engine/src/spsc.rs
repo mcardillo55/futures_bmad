@@ -64,6 +64,11 @@ impl MarketEventConsumer {
         self.consumer.slots()
     }
 
+    /// Total capacity of the underlying ring buffer.
+    pub fn capacity(&self) -> usize {
+        self.consumer.buffer().capacity()
+    }
+
     /// Fill fraction (0.0 to 1.0).
     pub fn fill_fraction(&self) -> f64 {
         let capacity = self.consumer.buffer().capacity();

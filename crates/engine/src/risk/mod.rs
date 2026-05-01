@@ -42,7 +42,7 @@ pub use alerting::{
     BreakerKind, DEFAULT_SCRIPT_TIMEOUT, FlattenAttemptDetail, PositionSnapshot,
     SharedAlertSender, alert_channel,
 };
-pub use circuit_breakers::CircuitBreakers;
+pub use circuit_breakers::{CircuitBreakers, ConnectionState};
 pub use event_windows::{ActiveEvent, EventWindowManager, TradingRestriction};
 pub use fee_gate::{FeeGate, FeeGateReason};
 pub use panic_mode::{ActivationOutcome, OrderCancellation, PanicContext, PanicMode, PanicState};

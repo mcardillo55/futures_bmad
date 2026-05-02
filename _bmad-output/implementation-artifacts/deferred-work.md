@@ -179,7 +179,7 @@ Note: S-2 from this review (partial entry over-sizes SL/TP via warn-only) is the
 
 - S-1: Orchestrator routes orders straight from the SPSC into `MockFillSimulator::simulate`, never invoking `BrokerAdapter::submit_order`; the BrokerAdapter is held but ornamental on the order path. AC1/Task 3.4 require routing via `submit_order`. Owned by Story 8.2 wiring. [`crates/engine/src/paper/orchestrator.rs`]
 - S-2: PaperTradingOrchestrator owns NO circuit breakers, risk, regime, or position tracker. The `circuit_breakers_trip_identically_in_paper_mode` test proves the breaker code works in isolation, NOT that the orchestrator integrates it. AC2 ("all subsystems function normally") is structurally unwired. Owned by Story 8.2. [`crates/engine/src/paper/orchestrator.rs`]
-- S-3: `MarketDataFeed::next_event` returning `None` conflates "end of stream" with "no event right now" — `pump_until_idle` exits on first quiet moment of any production stream. Split into `enum { Event, Idle, Terminated }` or add `is_terminated()`. Breaks the dev's "one-line Epic-8 swap" claim. [`crates/engine/src/paper/data_feed.rs:23-37`, `crates/engine/src/paper/orchestrator.rs:340-373`]
+- [x] S-3: `MarketDataFeed::next_event` returning `None` conflates "end of stream" with "no event right now" — `pump_until_idle` exits on first quiet moment of any production stream. Split into `enum { Event, Idle, Terminated }` or add `is_terminated()`. Breaks the dev's "one-line Epic-8 swap" claim. **Resolved in pre-Epic-8 cleanup commit (B-1):** `MarketDataFeed::next_event` now returns `enum NextEvent { Event(MarketEvent), Idle, Terminated }`. `pump_until_idle` exits ONLY on `Terminated`; on `Idle` it drains SPSCs and continues to poll. `tick` now returns `NextEvent` so hosts driving their own outer loop can decide when to exit. `VecMarketDataFeed` returns `Terminated` once exhausted (sticky via `IntoIter::next` semantics). 7 new tests cover the three-state contract + sticky invariant + orchestrator-side AC (`pump_until_idle_does_not_exit_on_idle`). [`crates/engine/src/paper/data_feed.rs`, `crates/engine/src/paper/orchestrator.rs:393-487`]
 - S-4: `engine --paper --config config/paper.toml` ships as zero-event smoke runner: no journal, no subscriptions, no live data wiring. Document the V1 scope in startup banner or refuse to start without explicit `--smoke` flag. [`crates/engine/src/main.rs:154-211`]
 - N-2: `subscribe_all` is async but binary's `run_paper` is sync — subscriptions never reach the in-process broker. Promote `tokio` to non-dev dep and run from a runtime when wiring subscription handling. [`crates/engine/src/paper/orchestrator.rs:209-220`, `crates/engine/src/main.rs:154-211`]
 - N-5: `sanity_check_paper_credentials` reads env var directly; env-var-touching tests race in parallel, making the warning branch effectively untestable. Take env-var name/reader as parameter or document the untested gap. [`crates/engine/src/startup.rs:84-103`]
@@ -199,6 +199,33 @@ Note: S-2 from this review (partial entry over-sizes SL/TP via warn-only) is the
 - N-7: `ReadinessReport::fmt_one_line` formats `win_rate` as 3 decimals (`0.500`); operators may misread as 50% vs 0.5 of a percent. Format as `50.0%` or document convention prominently. [`crates/engine/src/persistence/query.rs:170-184`]
 
 ---
+
+## Deferred from: review of pre-Epic-8 cleanup spec / B-1 (2026-05-02)
+
+Three reviewers (Blind Hunter, Edge Case Hunter, Acceptance Auditor) audited the B-1 diff. Six findings classified `defer` — pre-existing observability gaps, documented contract enforcement gaps, or items deliberately scoped to Story 8.2.
+
+- **`pump_until_idle` has no shutdown signal / max-idle bound.** A `MarketDataFeed` impl that returns `Idle` indefinitely makes the pump unkillable. The new `yield_now()` patch bounds CPU spend, but a feed truly stuck in `Idle` with no `Terminated` produces an infinite loop. Owner: Story 8.2 (the host loop owns shutdown signaling — Ctrl-C handler, max-duration, structured shutdown channel). [`crates/engine/src/paper/orchestrator.rs::pump_until_idle`]
+
+- **`tick` returns `NextEvent::Event` when the SPSC drops the event.** When both `try_push` attempts fail the warn fires and `events_pushed` does not increment, but the return value still says `Event`. The new contract documents the return as "what the FEED reported" — drop visibility lives only in the warn log. Pre-existing observability gap (the drop-and-warn was identical before B-1). Resolution: a future story can add a structured drop signal (`enum TickOutcome { Pushed(MarketEvent), Dropped(MarketEvent), ... }` or a counter on the orchestrator). [`crates/engine/src/paper/orchestrator.rs::tick`]
+
+- **`last_event_ts` advances past dropped events.** Both `tick` and `pump_until_idle` set `last_event_ts = Some(event.timestamp)` BEFORE attempting the SPSC push. If the push fails, `last_event_ts` reflects an event that was never ingested. Pre-existing in both pump variants. Resolution: gate the assignment on push success; small but touches both call sites. [`crates/engine/src/paper/orchestrator.rs:399`, `:455`]
+
+- **Sticky-`Terminated` invariant unenforced for non-`VecMarketDataFeed` impls.** The trait rustdoc says "every subsequent call must also return `Terminated`" but no defensive wrapper or debug-assert verifies the contract. A buggy production adapter (Epic 8 `RithmicMarketDataFeed`) could yield `Event` after `Terminated` and `pump_until_idle` would silently re-enter the Event arm. Spec explicitly leaves this as a documented contract; a future enforcement story can add a `FuseFeed<F>` wrapper or debug-assert. [`crates/engine/src/paper/data_feed.rs::MarketDataFeed`]
+
+- **`MarketEvent: Copy` assumption baked into orchestrator.** `pump_until_idle` and `tick` consume `MarketEvent` by value AND reference it after a `try_push` move (which is sound only because `MarketEvent: Copy`). If `MarketEvent` ever grows a non-`Copy` field (`String`, `Vec`, etc.), both call sites break. Forward-compat concern only. Resolution: surface at the time `MarketEvent` is extended. [`crates/engine/src/paper/orchestrator.rs:399-406`, `:455-462`]
+
+- **Post-`Terminated` `tick` calls keep doing full SPSC drain work.** Once the feed has terminated, every subsequent `tick()` runs the three drain calls. Sticky-`Terminated` is correct, but a fast-path early-return after the first `Terminated` would save work. Minor optimization; defer until a profiler shows it matters.
+
+## Deferred from: split of pre-Epic-8 cleanup spec (2026-05-02)
+
+Initial pre-Epic-8 cleanup spec proposed five items (B-1..B-5). Split for context-window discipline. The main spec (`spec-pre-epic-8-cleanup`) covers B-1 only; the four below land in a follow-up cleanup spec or absorb into Story 8.2's first commit.
+
+- **B-2 (7-4 S-3): `JournalQuery::trace_decision(0)` collision.** One-line guard returning `Err(JournalError::InvalidDecisionId)`. Mechanically independent of B-1.
+- **B-3 (7-4 S-5): replay journal default path.** Add `DEFAULT_REPLAY_DB_PATH = "data/replay.db"` and wire `run_replay` in `main.rs` to auto-attach. Mechanically independent of B-1.
+- **B-4 (7-2 S-1): `ReplayResult::compare()` length-divergence sentinels.** Five vector pairs need sentinel mismatches when lengths differ. Mechanically independent of B-1.
+- **B-5 (7-1 S-3): delete dead `ReplayDriver`.** File deletion + two re-export removals. Mechanically independent of B-1.
+
+All four remain tracked in their original `## Deferred from: code review of story-7.x` sections above; this section is the index for the split decision.
 
 ## Live-Trading Exit Gates
 

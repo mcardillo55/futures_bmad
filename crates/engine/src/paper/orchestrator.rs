@@ -35,7 +35,7 @@ use futures_bmad_testkit::{MockBehavior, MockBrokerAdapter};
 use tracing::{info, warn};
 
 use crate::order_book::apply_market_event;
-use crate::paper::data_feed::MarketDataFeed;
+use crate::paper::data_feed::{MarketDataFeed, NextEvent};
 use crate::persistence::journal::{EngineEvent as JournalEvent, JournalSender, SystemEventRecord};
 use crate::persistence::query::{JournalQuery, ReadinessReport};
 use crate::replay::fill_sim::{FillModel, MockFillSimulator};
@@ -362,6 +362,14 @@ impl<F: MarketDataFeed, C: Clock> PaperTradingOrchestrator<F, C> {
         &mut self.market_consumer
     }
 
+    /// Mirror of [`Self::market_consumer_mut`] for the producer half — test
+    /// fixtures use this to pre-load the market SPSC and verify that the
+    /// orchestrator's drain paths actually consume what is queued.
+    #[cfg(test)]
+    pub fn market_producer_mut(&mut self) -> &mut MarketEventProducer {
+        &mut self.market_producer
+    }
+
     /// Hand the engine→broker order producer to a downstream owner
     /// (the order manager). Tests use this directly to inject test orders.
     pub fn order_producer_mut(&mut self) -> &mut OrderQueueProducer {
@@ -393,29 +401,46 @@ impl<F: MarketDataFeed, C: Clock> PaperTradingOrchestrator<F, C> {
     pub fn pump_until_idle(&mut self) -> PaperTradingSummary {
         info!(target: "paper", "paper trading pump started");
 
-        while let Some(event) = self.feed.next_event() {
-            self.last_event_ts = Some(event.timestamp);
+        loop {
+            match self.feed.next_event() {
+                NextEvent::Event(event) => {
+                    self.last_event_ts = Some(event.timestamp);
 
-            // Step 2 — push onto market SPSC.
-            if !self.market_producer.try_push(event) {
-                self.drain_market_consumer();
-                if !self.market_producer.try_push(event) {
-                    warn!(target: "paper", "SPSC full even after draining — skipping event");
-                    continue;
+                    // Step 2 — push onto market SPSC.
+                    if !self.market_producer.try_push(event) {
+                        self.drain_market_consumer();
+                        if !self.market_producer.try_push(event) {
+                            warn!(target: "paper", "SPSC full even after draining — skipping event");
+                            continue;
+                        }
+                    }
+                    self.events_pushed += 1;
+
+                    // Step 3 — drain consumer side immediately so the engine
+                    // view of the book stays in lockstep with the producer.
+                    self.drain_market_consumer();
+
+                    // Steps 4+5 — pump orders→fills→engine.
+                    self.drain_orders_and_simulate_fills();
+                    self.drain_fills();
                 }
+                // Stream is alive but momentarily quiet — drain residual
+                // SPSC traffic and keep polling. MUST NOT exit the loop.
+                // Yield the scheduler so a feed that returns `Idle`
+                // continuously does not pin a core; production adapters
+                // (Story 8.2) own real backoff/parking, but `yield_now`
+                // bounds the worst-case CPU spend in the meantime.
+                NextEvent::Idle => {
+                    self.drain_market_consumer();
+                    self.drain_orders_and_simulate_fills();
+                    self.drain_fills();
+                    std::thread::yield_now();
+                }
+                NextEvent::Terminated => break,
             }
-            self.events_pushed += 1;
-
-            // Step 3 — drain consumer side immediately so the engine view
-            // of the book stays in lockstep with the producer.
-            self.drain_market_consumer();
-
-            // Steps 4+5 — pump orders→fills→engine.
-            self.drain_orders_and_simulate_fills();
-            self.drain_fills();
         }
 
-        // Final drain after feed exhaustion.
+        // Final drain after feed termination.
         self.drain_market_consumer();
         self.drain_orders_and_simulate_fills();
         self.drain_fills();
@@ -432,21 +457,38 @@ impl<F: MarketDataFeed, C: Clock> PaperTradingOrchestrator<F, C> {
     /// pump SPSCs". Production callers running the engine event loop on
     /// the consumer side use this from their tick loop so the orchestrator
     /// does not own the entire blocking pump.
-    pub fn tick(&mut self) {
-        if let Some(event) = self.feed.next_event() {
-            self.last_event_ts = Some(event.timestamp);
-            if !self.market_producer.try_push(event) {
-                self.drain_market_consumer();
+    ///
+    /// Returns the underlying [`NextEvent`] state so the caller's outer
+    /// loop can decide when to exit (typically: keep ticking while
+    /// [`NextEvent::Event`] / [`NextEvent::Idle`]; exit on
+    /// [`NextEvent::Terminated`]).
+    pub fn tick(&mut self) -> NextEvent {
+        // `MarketEvent: Copy` lets us forward the event into both `try_push`
+        // and the returned `NextEvent::Event(event)` value (callers expect
+        // the return to reflect what the FEED reported, not what the SPSC
+        // accepted — drop diagnostics live on the warn log).
+        let outcome = match self.feed.next_event() {
+            NextEvent::Event(event) => {
+                self.last_event_ts = Some(event.timestamp);
                 if !self.market_producer.try_push(event) {
-                    warn!(target: "paper", "SPSC full even after draining — skipping event (tick)");
+                    self.drain_market_consumer();
+                    if !self.market_producer.try_push(event) {
+                        warn!(target: "paper", "SPSC full even after draining — skipping event (tick)");
+                    } else {
+                        self.events_pushed += 1;
+                    }
+                } else {
+                    self.events_pushed += 1;
                 }
-            } else {
-                self.events_pushed += 1;
+                NextEvent::Event(event)
             }
-        }
+            NextEvent::Idle => NextEvent::Idle,
+            NextEvent::Terminated => NextEvent::Terminated,
+        };
         self.drain_market_consumer();
         self.drain_orders_and_simulate_fills();
         self.drain_fills();
+        outcome
     }
 
     fn drain_market_consumer(&mut self) {
@@ -674,5 +716,102 @@ mod tests {
         assert!(positions.is_empty());
         let open = broker.query_open_orders().await.unwrap();
         assert!(open.is_empty());
+    }
+
+    /// Test feed that yields `Idle` for a configured count then `Terminated`.
+    /// Used to verify `pump_until_idle` keeps polling on `Idle` and exits
+    /// only on `Terminated` (the contract that lets streaming production
+    /// adapters work without spurious termination on transient quiet
+    /// periods).
+    struct IdleThenTerminatedFeed {
+        idle_remaining: usize,
+        terminated: bool,
+    }
+
+    impl IdleThenTerminatedFeed {
+        fn new(idle_count: usize) -> Self {
+            Self {
+                idle_remaining: idle_count,
+                terminated: false,
+            }
+        }
+    }
+
+    impl crate::paper::data_feed::MarketDataFeed for IdleThenTerminatedFeed {
+        fn next_event(&mut self) -> crate::paper::data_feed::NextEvent {
+            if self.terminated {
+                return crate::paper::data_feed::NextEvent::Terminated;
+            }
+            if self.idle_remaining > 0 {
+                self.idle_remaining -= 1;
+                crate::paper::data_feed::NextEvent::Idle
+            } else {
+                self.terminated = true;
+                crate::paper::data_feed::NextEvent::Terminated
+            }
+        }
+    }
+
+    /// B-1 AC — `pump_until_idle` does NOT exit on `Idle`, AND the `Idle`
+    /// arm runs the SPSC drains. The feed returns `Idle` for 10 polls
+    /// then `Terminated`. We pre-load an event onto the market SPSC; if
+    /// the `Idle` arm fires `drain_market_consumer`, that pre-loaded event
+    /// is observed via `events_consumed`. If `Idle` were a no-op, the
+    /// final drain after the loop would consume it instead — but we
+    /// observe it BEFORE the loop ends, proving the `Idle`-arm drain.
+    #[test]
+    fn pump_until_idle_does_not_exit_on_idle() {
+        let feed = IdleThenTerminatedFeed::new(10);
+        let mut orch = PaperTradingOrchestrator::new(PaperTradingConfig::default(), feed);
+
+        // Pre-load the market SPSC with an event the orchestrator did not
+        // push itself. The Idle-arm drain must consume it.
+        assert!(orch.market_producer_mut().try_push(bid(1, 100)));
+        let pre_loaded_consumed = orch.events_consumed();
+        assert_eq!(pre_loaded_consumed, 0);
+
+        let summary = orch.pump_until_idle();
+
+        assert_eq!(orch.events_pushed, 0, "Idle must NOT push to SPSC");
+        assert_eq!(
+            summary.events_consumed, 1,
+            "Idle arm must run drain_market_consumer — pre-loaded event was consumed"
+        );
+    }
+
+    /// B-1 AC — `tick` returns `NextEvent` so the host's outer loop can
+    /// decide when to exit. Sequence: `Idle` → `Idle` → `Terminated`.
+    #[test]
+    fn tick_returns_next_event_state() {
+        use crate::paper::data_feed::NextEvent;
+        let feed = IdleThenTerminatedFeed::new(2);
+        let mut orch = PaperTradingOrchestrator::new(PaperTradingConfig::default(), feed);
+
+        assert!(matches!(orch.tick(), NextEvent::Idle));
+        assert_eq!(orch.events_pushed, 0);
+        assert!(matches!(orch.tick(), NextEvent::Idle));
+        assert_eq!(orch.events_pushed, 0);
+        assert!(matches!(orch.tick(), NextEvent::Terminated));
+        // Sticky: subsequent ticks keep returning Terminated.
+        assert!(matches!(orch.tick(), NextEvent::Terminated));
+    }
+
+    /// B-1 AC — `tick` on an `Event` feed produces a non-zero
+    /// `events_pushed` count and reports `NextEvent::Event`.
+    #[test]
+    fn tick_returns_event_and_pushes_when_event_yielded() {
+        use crate::paper::data_feed::NextEvent;
+        let feed = VecMarketDataFeed::new(vec![bid(1, 100)]);
+        let mut orch = PaperTradingOrchestrator::new(PaperTradingConfig::default(), feed);
+
+        let outcome = orch.tick();
+        assert!(
+            matches!(outcome, NextEvent::Event(_)),
+            "expected Event, got {outcome:?}"
+        );
+        assert_eq!(orch.events_pushed, 1);
+
+        // Next tick should report Terminated (sticky once the Vec is drained).
+        assert!(matches!(orch.tick(), NextEvent::Terminated));
     }
 }

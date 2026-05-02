@@ -1,0 +1,44 @@
+# Story 7.2 — committed test config for deterministic replay verification.
+#
+# Loaded by `crates/engine/tests/replay_determinism.rs`. Any change to the
+# values here will shift Tier 2 (signal) and Tier 3 (regime) outputs and
+# therefore force the insta snapshot to be regenerated under
+# `cargo insta review` — that review is the regression mechanism (Task
+# 7.3).
+#
+# Deliberately small: ~1000 generated events at this config exercise OBI
+# warmup, multiple VPIN buckets, a handful of microprice updates, several
+# regime classifier bars (1 minute each), and at least one round-trip
+# trade. Larger corpora belong in benchmarks, not the determinism gate.
+
+[signals]
+# Number of OBI updates required before the signal returns Some(value).
+obi_warmup = 5
+# 16 quarter-ticks = 4 ticks; well above the 1-tick spreads the test
+# generator emits, so the book is always tradeable.
+max_spread_qt = 16
+# VPIN bucket size in volume units (sum of buy + sell trade size).
+vpin_bucket_size = 50
+# Number of buckets in the rolling VPIN window.
+vpin_num_buckets = 5
+
+[regime]
+# Bar interval in nanoseconds — 1 minute. Generator emits one trade per
+# second; with 1000 events that gives ~16 closed bars, comfortably above
+# the warmup_period below so the detector ships at least a few non-Unknown
+# classifications inside the snapshot.
+bar_interval_nanos = 60_000_000_000
+warmup_period = 5
+bar_interval_minutes = 1
+atr_period = 5
+atr_trending_threshold = 1.0
+atr_volatile_threshold = 5.0
+directional_persistence_threshold = 0.7
+range_body_ratio_threshold = 3.0
+unknown_blocks_trading = true
+
+[snapshots]
+# Capture a Signal::snapshot() every N events. 250 over a 1000-event run
+# gives 4 snapshots — small enough to keep the insta artefact reviewable,
+# large enough to span the warmup → fully-warm transition.
+interval = 250

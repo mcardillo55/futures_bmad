@@ -63,6 +63,12 @@ fn main() -> ExitCode {
         fill_model: FillModel::ImmediateAtMarket,
         summary_output: true,
         market_event_capacity: None,
+        // Story 7.2 instrumentation knobs default off for the binary entry
+        // point — `run()` does not read them. The instrumented capture path
+        // (`run_with_capture`) is wired up by tests / future stories.
+        snapshot_interval: None,
+        signal_instrumentation: futures_bmad_engine::replay::SignalInstrumentationConfig::default(),
+        regime_instrumentation: None,
     };
 
     let mut orch = match ReplayOrchestrator::new(cfg) {

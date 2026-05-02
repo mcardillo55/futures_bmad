@@ -21,13 +21,21 @@
 //! `event_loop.rs`. The trait-based wiring is the entire mechanism.
 
 pub mod data_source;
+pub mod determinism;
 pub mod driver;
 pub mod fill_sim;
 pub mod orchestrator;
 
 pub use data_source::{ParquetReplaySource, ReplaySourceError};
+pub use determinism::{
+    DeterminismReport, FixedPriceMismatch, RegimeMismatch, SignalMismatch, SnapshotMismatch,
+    assert_fixed_price_identical, assert_regime_identical, assert_signal_epsilon,
+    DEFAULT_SIGNAL_EPSILON,
+};
 pub use driver::ReplayDriver;
 pub use fill_sim::{FillModel, MockFillSimulator};
 pub use orchestrator::{
-    ReplayConfig, ReplayError, ReplayOrchestrator, ReplaySummary,
+    PipelineSnapshotSerde, RegimeInstrumentationConfig, ReplayConfig, ReplayError,
+    ReplayOrchestrator, ReplayResult, ReplaySummary, SignalInstrumentationConfig,
+    SignalSnapshotSerde,
 };

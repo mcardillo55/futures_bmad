@@ -3,3 +3,9 @@ target/
 data/
 *.db
 *.db-wal
+
+# Story 7.2 — committed test datasets for deterministic replay verification
+# live under tests/data/. Without this exception the broader `data/` rule
+# would swallow them and the determinism gate would be unreproducible.
+!crates/engine/tests/data/
+!crates/engine/tests/data/**

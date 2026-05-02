@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::traits::clock::Clock;
 use crate::types::Bar;
@@ -7,10 +7,12 @@ use crate::types::Bar;
 ///
 /// `Hash` is derived so [`RegimeState`] can key the regime-to-strategy
 /// mapping in [`RegimeOrchestrationConfig`](crate::config::RegimeOrchestrationConfig).
-/// `serde::Deserialize` is derived so the same map can be loaded directly
-/// from a TOML inline table keyed on the variant names (`Trending`,
-/// `Rotational`, `Volatile`, `Unknown`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
+/// `serde::{Serialize, Deserialize}` are derived so the same map can be loaded
+/// directly from a TOML inline table keyed on the variant names (`Trending`,
+/// `Rotational`, `Volatile`, `Unknown`) and so [`RegimeState`] values can be
+/// captured into a `ReplayResult` (Story 7.2) for snapshot-based determinism
+/// verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 pub enum RegimeState {
     Trending,
     Rotational,

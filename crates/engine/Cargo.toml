@@ -32,3 +32,7 @@ path = "src/main.rs"
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 toml = { workspace = true }
+# Story 7.2 — snapshot regression tests for deterministic replay output.
+# `yaml` feature gives stable, human-reviewable diff output via
+# `assert_yaml_snapshot!`.
+insta = { workspace = true, features = ["yaml"] }

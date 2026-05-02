@@ -196,6 +196,9 @@ fn fill_model_immediate_at_market_explicit() {
         fill_model: FillModel::ImmediateAtMarket,
         summary_output: false,
         market_event_capacity: Some(64),
+        snapshot_interval: None,
+        signal_instrumentation: futures_bmad_engine::replay::SignalInstrumentationConfig::default(),
+        regime_instrumentation: None,
     };
     let mut orch = ReplayOrchestrator::new(cfg).unwrap();
     let summary = orch.run();

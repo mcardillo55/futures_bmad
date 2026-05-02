@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
-use futures_bmad_core::{FixedPrice, Side, UnixNanos};
+use futures_bmad_core::{FixedPrice, Side, TradeSource, UnixNanos};
 use rusqlite::{Connection, params};
 use tracing::{debug, error, info, warn};
 
@@ -45,6 +45,11 @@ pub const DEFAULT_DB_PATH: &str = "data/journal.db";
 /// - timestamps as INTEGER nanoseconds
 /// - prices as INTEGER quarter-ticks (FixedPrice raw)
 /// - table names snake_case plural
+///
+/// Story 7.4 — `source` column on every trade-related table tags the row
+/// origin (`live`, `paper`, `replay`). Defaults to `'live'` so existing
+/// journals (created before the column was introduced) continue to read as
+/// live data after the migration runs in [`EventJournal::new`].
 const CREATE_TRADE_EVENTS: &str = "
     CREATE TABLE IF NOT EXISTS trade_events (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,7 +60,8 @@ const CREATE_TRADE_EVENTS: &str = "
         side         INTEGER NOT NULL,
         price        INTEGER NOT NULL,
         size         INTEGER NOT NULL,
-        kind         TEXT    NOT NULL
+        kind         TEXT    NOT NULL,
+        source       TEXT    NOT NULL DEFAULT 'live'
     );
 ";
 
@@ -66,9 +72,45 @@ const CREATE_ORDER_STATES: &str = "
         order_id     INTEGER NOT NULL,
         decision_id  INTEGER,
         from_state   TEXT    NOT NULL,
-        to_state     TEXT    NOT NULL
+        to_state     TEXT    NOT NULL,
+        source       TEXT    NOT NULL DEFAULT 'live'
     );
 ";
+
+/// Index on `source` for efficient `WHERE source = ?` filtering used by
+/// [`crate::persistence::query::JournalQuery`] (Story 7.4 Task 1.5).
+const CREATE_SOURCE_INDEXES: &str = "
+    CREATE INDEX IF NOT EXISTS idx_trade_events_source ON trade_events(source);
+    CREATE INDEX IF NOT EXISTS idx_order_states_source ON order_states(source);
+";
+
+/// Migration applied at [`EventJournal::new`] to add the `source` column to
+/// journals created before Story 7.4. Idempotent — guarded by a runtime
+/// schema check so a fresh DB (already has the column) skips the ALTER.
+fn migrate_add_source_column(conn: &Connection) -> Result<(), JournalError> {
+    for table in ["trade_events", "order_states"] {
+        if !column_exists(conn, table, "source")? {
+            let stmt =
+                format!("ALTER TABLE {table} ADD COLUMN source TEXT NOT NULL DEFAULT 'live'");
+            conn.execute(&stmt, [])?;
+            info!(target: "journal", table, "added source column (Story 7.4 migration)");
+        }
+    }
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, JournalError> {
+    // PRAGMA table_info returns one row per column; matching on `name` (col 1)
+    // is the canonical SQLite check for "does this column exist?".
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 const CREATE_CIRCUIT_BREAKER_EVENTS: &str = "
     CREATE TABLE IF NOT EXISTS circuit_breaker_events (
@@ -114,6 +156,11 @@ const ALL_TABLE_DDL: &[&str] = &[
 ///
 /// Trade events MUST carry a `decision_id` so every fill/order-related entry chains back
 /// to the originating signal evaluation (NFR17).
+///
+/// Story 7.4 — `source` distinguishes paper / replay / live entries. Set
+/// implicitly by the [`JournalSender`] at send time; callers only need to
+/// override `source` when constructing a record outside the normal sender
+/// flow (tests, direct `EventJournal::write_event`).
 #[derive(Debug, Clone)]
 pub struct TradeEventRecord {
     pub timestamp: UnixNanos,
@@ -126,9 +173,14 @@ pub struct TradeEventRecord {
     pub size: u32,
     /// Free-form classification: "submit", "fill", "partial_fill", "cancel", etc.
     pub kind: String,
+    /// Origin of the trade entry — `Live` by default, overridden to `Paper` /
+    /// `Replay` by the orchestrator that owns the [`JournalSender`].
+    pub source: TradeSource,
 }
 
 /// Order state machine transition recorded into `order_states`.
+///
+/// Story 7.4 — `source` mirrors the same tag scheme as [`TradeEventRecord`].
 #[derive(Debug, Clone)]
 pub struct OrderStateChangeRecord {
     pub timestamp: UnixNanos,
@@ -136,6 +188,8 @@ pub struct OrderStateChangeRecord {
     pub decision_id: Option<u64>,
     pub from_state: String,
     pub to_state: String,
+    /// Origin of the state transition — see [`TradeEventRecord::source`].
+    pub source: TradeSource,
 }
 
 /// Circuit breaker activation recorded into `circuit_breaker_events`.
@@ -226,9 +280,19 @@ pub enum JournalError {
 /// a warning emitted. The hot path must NEVER block on the journal — losing a small
 /// number of audit events under extreme backpressure is preferable to stalling the
 /// event loop.
+///
+/// Story 7.4 — every sender carries an optional `source_override`. When
+/// `Some`, the sender stamps the override onto every trade/order record at
+/// send time, replacing whatever the caller put on the record. This is the
+/// single seam through which paper / replay orchestrators tag their entries
+/// without requiring every call site to know which mode it is running in.
+/// The default sender (from [`EventJournal::channel`]) has no override so
+/// records keep whatever value the caller set (defaulting to
+/// [`TradeSource::Live`]).
 #[derive(Clone)]
 pub struct JournalSender {
     inner: Sender<EngineEvent>,
+    source_override: Option<TradeSource>,
 }
 
 impl JournalSender {
@@ -236,7 +300,14 @@ impl JournalSender {
     ///
     /// Returns `true` if the event was accepted, `false` if it was dropped or the
     /// receiver was disconnected.
-    pub fn send(&self, event: EngineEvent) -> bool {
+    ///
+    /// If a `source_override` is set on this sender, trade-related variants
+    /// (`TradeEvent`, `OrderStateChange`) have their `source` field rewritten
+    /// to the override value before being enqueued.
+    pub fn send(&self, mut event: EngineEvent) -> bool {
+        if let Some(src) = self.source_override {
+            apply_source_override(&mut event, src);
+        }
         match self.inner.try_send(event) {
             Ok(()) => true,
             Err(TrySendError::Full(dropped)) => {
@@ -254,6 +325,25 @@ impl JournalSender {
         }
     }
 
+    /// Return a clone of this sender with `source_override = Some(source)`.
+    /// Used by the paper / replay orchestrators (Story 7.4 Task 2) to tag
+    /// every record they enqueue without modifying the existing call sites
+    /// in the order manager and bracket manager. Composes cleanly so a
+    /// JournalSender constructed with one source can be re-tagged downstream.
+    pub fn with_source(&self, source: TradeSource) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            source_override: Some(source),
+        }
+    }
+
+    /// Inspect the configured source override (`None` for the default
+    /// live-tagged sender). Exposed so orchestrators can assert on the
+    /// expected source at attach time.
+    pub fn source_override(&self) -> Option<TradeSource> {
+        self.source_override
+    }
+
     /// Approximate current channel depth (for monitoring/tests).
     pub fn len(&self) -> usize {
         self.inner.len()
@@ -262,6 +352,19 @@ impl JournalSender {
     /// Whether the channel is currently empty.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+}
+
+fn apply_source_override(event: &mut EngineEvent, source: TradeSource) {
+    match event {
+        EngineEvent::TradeEvent(r) => r.source = source,
+        EngineEvent::OrderStateChange(r) => r.source = source,
+        // Other variants are mode-agnostic (circuit breakers, regime
+        // transitions, system events) — they share schema across paper /
+        // replay / live and do not carry a source column.
+        EngineEvent::CircuitBreakerEvent(_)
+        | EngineEvent::RegimeTransition(_)
+        | EngineEvent::SystemEvent(_) => {}
     }
 }
 
@@ -338,6 +441,13 @@ impl EventJournal {
         }
         tx.commit()?;
 
+        // Story 7.4 Task 1 — backfill source column on existing journals
+        // (no-op on fresh DBs where the column already exists from the
+        // CREATE TABLE statement above) and create the source-column
+        // indexes for efficient WHERE source = ? filtering.
+        migrate_add_source_column(&conn)?;
+        conn.execute_batch(CREATE_SOURCE_INDEXES)?;
+
         info!(target: "journal", path = %db_path.display(), "event journal opened");
 
         Ok(Self {
@@ -352,9 +462,36 @@ impl EventJournal {
     }
 
     /// Construct a fresh bounded channel pair sized to `JOURNAL_CHANNEL_CAPACITY`.
+    ///
+    /// The returned [`JournalSender`] has no source override — records are
+    /// recorded with whatever `source` the caller put on them (defaulting to
+    /// [`TradeSource::Live`]). For paper / replay use
+    /// [`Self::channel_with_source`] or call [`JournalSender::with_source`]
+    /// on the returned sender.
     pub fn channel() -> (JournalSender, JournalReceiver) {
         let (tx, rx) = crossbeam_channel::bounded(JOURNAL_CHANNEL_CAPACITY);
-        (JournalSender { inner: tx }, JournalReceiver { inner: rx })
+        (
+            JournalSender {
+                inner: tx,
+                source_override: None,
+            },
+            JournalReceiver { inner: rx },
+        )
+    }
+
+    /// Story 7.4 — construct a channel whose sender stamps every trade /
+    /// order record with `source`. Equivalent to
+    /// `EventJournal::channel().0.with_source(source)` plus the matching
+    /// receiver, packaged as a single call for the orchestrator wiring path.
+    pub fn channel_with_source(source: TradeSource) -> (JournalSender, JournalReceiver) {
+        let (tx, rx) = crossbeam_channel::bounded(JOURNAL_CHANNEL_CAPACITY);
+        (
+            JournalSender {
+                inner: tx,
+                source_override: Some(source),
+            },
+            JournalReceiver { inner: rx },
+        )
     }
 
     /// Run the synchronous batching write loop until all senders disconnect.
@@ -499,8 +636,8 @@ impl EventJournal {
                 }
                 tx.execute(
                     "INSERT INTO trade_events
-                        (timestamp, decision_id, order_id, symbol_id, side, price, size, kind)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        (timestamp, decision_id, order_id, symbol_id, side, price, size, kind, source)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         r.timestamp.as_nanos() as i64,
                         // Persist decision_id as 0 sentinel when missing — keeps NOT NULL.
@@ -511,20 +648,22 @@ impl EventJournal {
                         r.price.raw(),
                         r.size as i64,
                         r.kind.as_str(),
+                        r.source.as_str(),
                     ],
                 )?;
             }
             EngineEvent::OrderStateChange(r) => {
                 tx.execute(
                     "INSERT INTO order_states
-                        (timestamp, order_id, decision_id, from_state, to_state)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                        (timestamp, order_id, decision_id, from_state, to_state, source)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         r.timestamp.as_nanos() as i64,
                         r.order_id as i64,
                         r.decision_id.map(|id| id as i64),
                         r.from_state.as_str(),
                         r.to_state.as_str(),
+                        r.source.as_str(),
                     ],
                 )?;
             }
@@ -604,6 +743,7 @@ mod tests {
             price: FixedPrice::new(17929), // 4482.25
             size: 1,
             kind: "submit".to_string(),
+            source: TradeSource::Live,
         })
     }
 
@@ -614,6 +754,7 @@ mod tests {
             decision_id: Some(7),
             from_state: "Idle".to_string(),
             to_state: "Submitted".to_string(),
+            source: TradeSource::Live,
         })
     }
 
@@ -708,7 +849,10 @@ mod tests {
     fn channel_backpressure_drops_when_full() {
         // Use a tiny custom channel to provoke the full state without enqueueing 8192 events.
         let (tx, rx) = crossbeam_channel::bounded::<EngineEvent>(2);
-        let sender = JournalSender { inner: tx };
+        let sender = JournalSender {
+            inner: tx,
+            source_override: None,
+        };
 
         assert!(sender.send(sample_system()));
         assert!(sender.send(sample_system()));
@@ -743,6 +887,7 @@ mod tests {
                 price: px,
                 size: 3,
                 kind: "fill".to_string(),
+                source: TradeSource::Live,
             }))
             .unwrap();
 
@@ -913,5 +1058,174 @@ mod tests {
             count, N as i64,
             "every event must be persisted even when the channel briefly empties"
         );
+    }
+
+    /// Story 7.4 Task 1.1/1.2 — fresh journals create the trade_events and
+    /// order_states tables with a `source` column that defaults to 'live'.
+    #[test]
+    fn fresh_journal_has_source_columns_defaulting_to_live() {
+        let (journal, _dir) = make_journal();
+        for table in ["trade_events", "order_states"] {
+            // PRAGMA table_info — column `name` is index 1, `dflt_value` is 4.
+            let mut stmt = journal
+                .conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let mut found_source = false;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, Option<String>>(4)?))
+                })
+                .unwrap();
+            for row in rows {
+                let (name, default) = row.unwrap();
+                if name == "source" {
+                    found_source = true;
+                    let dflt = default.unwrap_or_default();
+                    assert!(
+                        dflt.contains("live"),
+                        "{table}.source default must be 'live', got {dflt:?}"
+                    );
+                }
+            }
+            assert!(
+                found_source,
+                "{table} must have a `source` column post-Story 7.4"
+            );
+        }
+    }
+
+    /// Story 7.4 Task 1.5 — source-column index exists for efficient
+    /// WHERE source = ? filtering.
+    #[test]
+    fn source_column_indexes_exist() {
+        let (journal, _dir) = make_journal();
+        for index in ["idx_trade_events_source", "idx_order_states_source"] {
+            let count: i64 = journal
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    params![index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "expected source index {index} to exist");
+        }
+    }
+
+    /// Story 7.4 Task 1 — migration backfills the source column on a journal
+    /// created with the pre-7.4 schema (no source column). Simulates the
+    /// upgrade path: old DB on disk gets the column added on next open and
+    /// existing rows default to 'live'.
+    #[test]
+    fn migration_adds_source_column_to_pre_story_7_4_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+
+        // Create a journal with the pre-7.4 schema (no source column) and
+        // insert one row so the migration has data to coerce.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE trade_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER NOT NULL,
+                    decision_id INTEGER NOT NULL,
+                    order_id INTEGER,
+                    symbol_id INTEGER NOT NULL,
+                    side INTEGER NOT NULL,
+                    price INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    kind TEXT NOT NULL
+                );
+                CREATE TABLE order_states (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER NOT NULL,
+                    order_id INTEGER NOT NULL,
+                    decision_id INTEGER,
+                    from_state TEXT NOT NULL,
+                    to_state TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO trade_events
+                    (timestamp, decision_id, order_id, symbol_id, side, price, size, kind)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![1i64, 1i64, 1i64, 1i64, 0i64, 100i64, 1i64, "fill"],
+            )
+            .unwrap();
+        }
+
+        // Re-open through the production path — migration runs, source column
+        // is added, the existing row backfills to 'live'.
+        let _journal = EventJournal::new(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let source: String = conn
+            .query_row("SELECT source FROM trade_events LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(source, "live", "pre-7.4 row backfilled to 'live' source");
+    }
+
+    /// Story 7.4 Task 2 — sender override stamps the source onto trade /
+    /// order records before they enter the channel. Other variant types
+    /// (system events, breakers, regime transitions) are not source-tagged
+    /// and pass through unchanged.
+    #[test]
+    fn sender_override_stamps_trade_and_order_records_only() {
+        let (paper_sender, paper_rx) = EventJournal::channel_with_source(TradeSource::Paper);
+
+        let trade = EngineEvent::TradeEvent(TradeEventRecord {
+            timestamp: UnixNanos::new(1),
+            decision_id: Some(1),
+            order_id: Some(1),
+            symbol_id: 1,
+            side: Side::Buy,
+            price: FixedPrice::new(100),
+            size: 1,
+            kind: "fill".into(),
+            source: TradeSource::Live, // sender will rewrite
+        });
+        let order = EngineEvent::OrderStateChange(OrderStateChangeRecord {
+            timestamp: UnixNanos::new(2),
+            order_id: 1,
+            decision_id: Some(1),
+            from_state: "Idle".into(),
+            to_state: "Submitted".into(),
+            source: TradeSource::Live, // sender will rewrite
+        });
+        let system = EngineEvent::SystemEvent(SystemEventRecord {
+            timestamp: UnixNanos::new(3),
+            category: "test".into(),
+            message: "msg".into(),
+        });
+        assert!(paper_sender.send(trade));
+        assert!(paper_sender.send(order));
+        assert!(paper_sender.send(system));
+
+        // Trade and order get rewritten; system event passes through.
+        let mut saw_trade_paper = false;
+        let mut saw_order_paper = false;
+        let mut saw_system = false;
+        for _ in 0..8 {
+            match paper_rx.try_recv_for_test() {
+                Some(EngineEvent::TradeEvent(r)) => {
+                    assert_eq!(r.source, TradeSource::Paper);
+                    saw_trade_paper = true;
+                }
+                Some(EngineEvent::OrderStateChange(r)) => {
+                    assert_eq!(r.source, TradeSource::Paper);
+                    saw_order_paper = true;
+                }
+                Some(EngineEvent::SystemEvent(_)) => saw_system = true,
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(saw_trade_paper);
+        assert!(saw_order_paper);
+        assert!(saw_system);
     }
 }

@@ -47,7 +47,9 @@ pub use wal::{OrderWal, PendingOrder, WalError};
 use std::collections::HashMap;
 
 use futures_bmad_broker::{FillQueueConsumer, OrderQueueProducer};
-use futures_bmad_core::{FillEvent, FillType, OrderEvent, OrderState, RejectReason, UnixNanos};
+use futures_bmad_core::{
+    FillEvent, FillType, OrderEvent, OrderState, RejectReason, TradeSource, UnixNanos,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::persistence::journal::{
@@ -386,13 +388,16 @@ impl OrderManager {
         );
 
         // Journal the Idle -> Submitted transition so the audit trail is
-        // complete from order birth.
+        // complete from order birth. `source` is overridden by the
+        // JournalSender when paper / replay orchestrators have stamped one;
+        // otherwise it stays at the default `Live` value.
         let record = OrderStateChangeRecord {
             timestamp: event.timestamp,
             order_id: event.order_id,
             decision_id: Some(event.decision_id),
             from_state: format!("{:?}", OrderState::Idle),
             to_state: format!("{:?}", OrderState::Submitted),
+            source: TradeSource::default(),
         };
         let _ = self.journal.send(JournalEvent::OrderStateChange(record));
         Ok(())
@@ -522,6 +527,7 @@ impl OrderManager {
                 decision_id: Some(fill.decision_id),
                 from_state: format!("{:?}", OrderState::Submitted),
                 to_state: format!("{:?}", OrderState::Confirmed),
+                source: TradeSource::default(),
             };
             let _ = self
                 .journal
@@ -628,6 +634,7 @@ impl OrderManager {
             decision_id: Some(fill.decision_id),
             from_state: format!("{from_state:?}"),
             to_state: format!("{to_state:?}"),
+            source: TradeSource::default(),
         };
         let sent = self.journal.send(JournalEvent::OrderStateChange(record));
         if !sent {
@@ -739,6 +746,7 @@ impl OrderManager {
                         decision_id: Some(sm.decision_id()),
                         from_state: format!("{:?}", OrderState::Submitted),
                         to_state: format!("{:?}", OrderState::Uncertain),
+                        source: TradeSource::default(),
                     };
                     let _ = self.journal.send(JournalEvent::OrderStateChange(record));
                 }
@@ -771,6 +779,7 @@ impl OrderManager {
             decision_id: Some(sm.decision_id()),
             from_state: format!("{:?}", OrderState::Uncertain),
             to_state: format!("{:?}", OrderState::PendingRecon),
+            source: TradeSource::default(),
         };
         let _ = self.journal.send(JournalEvent::OrderStateChange(record));
         Ok(())
@@ -921,6 +930,7 @@ impl OrderManager {
                 decision_id: Some(sm.decision_id()),
                 from_state: format!("{:?}", OrderState::PendingRecon),
                 to_state: format!("{:?}", OrderState::Resolved),
+                source: TradeSource::default(),
             };
             let _ = self.journal.send(JournalEvent::OrderStateChange(record));
         }

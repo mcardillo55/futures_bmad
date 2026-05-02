@@ -26,7 +26,7 @@ use futures_bmad_broker::{
 };
 use futures_bmad_core::{
     Bar, Clock, FillType, FixedPrice, MarketEvent, MarketEventType, OrderBook, OrderEvent,
-    RegimeDetector, RegimeState, SignalSnapshot, UnixNanos,
+    RegimeDetector, RegimeState, SignalSnapshot, TradeSource, UnixNanos,
 };
 use futures_bmad_testkit::{MockBehavior, MockBrokerAdapter, SimClock};
 use serde::{Deserialize, Serialize};
@@ -575,7 +575,11 @@ impl ReplayOrchestrator {
         // gates the stale-data detector which is irrelevant in replay.
         sim_clock.set_market_open(true);
 
-        let broker = MockBrokerAdapter::new(MockBehavior::Fill);
+        // Story 7.4 Task 2.3 — replay-tagged mock broker. Same rationale
+        // as the paper orchestrator: actual journal stamping happens via
+        // the JournalSender override in `attach_journal`, but the adapter
+        // exposes its source so the wiring is self-documenting.
+        let broker = MockBrokerAdapter::with_source(MockBehavior::Fill, TradeSource::Replay);
         let capacity = config
             .market_event_capacity
             .unwrap_or(MARKET_EVENT_QUEUE_CAPACITY);
@@ -612,10 +616,15 @@ impl ReplayOrchestrator {
     /// events as the replay progresses and (b) flows trade events into the
     /// same audit trail live trading uses (Story 7.1 Task 7.3).
     ///
+    /// Story 7.4 — the supplied sender is re-tagged with
+    /// [`TradeSource::Replay`] before being stored, so every trade /
+    /// order-state record routed through this orchestrator is stamped
+    /// `source = "replay"` in the journal.
+    ///
     /// Optional: when no journal is attached the orchestrator still
     /// computes summary statistics, but no SQLite persistence happens.
     pub fn attach_journal(&mut self, journal: JournalSender) {
-        self.journal = Some(journal);
+        self.journal = Some(journal.with_source(TradeSource::Replay));
     }
 
     /// Get a clone-able handle to the SimClock so other engine components

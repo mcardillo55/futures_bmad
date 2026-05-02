@@ -1,4 +1,6 @@
-use futures_bmad_core::{BrokerAdapter, BrokerError, BrokerPosition, OrderParams, OrderState};
+use futures_bmad_core::{
+    BrokerAdapter, BrokerError, BrokerPosition, OrderParams, OrderState, TradeSource,
+};
 
 #[derive(Debug, Clone)]
 pub enum MockBehavior {
@@ -16,10 +18,27 @@ pub struct MockBrokerAdapter {
     subscriptions: Vec<String>,
     positions: Vec<BrokerPosition>,
     open_orders: Vec<(u64, OrderState)>,
+    /// Story 7.4 Task 2.3 — origin tag the orchestrator wires in at
+    /// construction time. Paper mode passes `Paper`; replay passes `Replay`.
+    /// The mock itself does not write directly to the journal — the
+    /// `JournalSender` configured by the orchestrator is the actual stamping
+    /// seam — but exposing the configured source on the adapter keeps the
+    /// audit story complete: a reviewer reading the wiring code can verify
+    /// at a glance that paper/replay orchestrators are passing the right tag.
+    source: TradeSource,
 }
 
 impl MockBrokerAdapter {
+    /// Construct a mock broker tagged as live (default). Existing tests that
+    /// don't care about the source continue to use this constructor.
     pub fn new(behavior: MockBehavior) -> Self {
+        Self::with_source(behavior, TradeSource::default())
+    }
+
+    /// Story 7.4 Task 2.3 — construct a mock broker with an explicit
+    /// [`TradeSource`]. Paper-mode wiring passes [`TradeSource::Paper`];
+    /// replay wiring passes [`TradeSource::Replay`].
+    pub fn with_source(behavior: MockBehavior, source: TradeSource) -> Self {
         Self {
             behavior,
             submitted_orders: Vec::new(),
@@ -28,7 +47,15 @@ impl MockBrokerAdapter {
             subscriptions: Vec::new(),
             positions: Vec::new(),
             open_orders: Vec::new(),
+            source,
         }
+    }
+
+    /// Inspect the source tag this adapter was constructed with — exposed so
+    /// orchestrators (and their tests) can assert the wiring matches the
+    /// expected mode.
+    pub fn source(&self) -> TradeSource {
+        self.source
     }
 
     pub fn submitted_orders(&self) -> &[OrderParams] {

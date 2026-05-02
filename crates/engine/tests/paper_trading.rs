@@ -11,7 +11,7 @@
 
 use futures_bmad_core::{
     BrokerAdapter, BrokerMode, FillType, FixedPrice, MarketEvent, MarketEventType, OrderEvent,
-    OrderType, Side, UnixNanos,
+    OrderType, Side, TradeSource, UnixNanos,
 };
 use futures_bmad_engine::paper::{PaperTradingConfig, PaperTradingOrchestrator, VecMarketDataFeed};
 use futures_bmad_engine::persistence::{
@@ -140,6 +140,7 @@ fn journal_interface_supports_extension_for_paper_trade_recording() {
         price: FixedPrice::new(18_000),
         size: 1,
         kind: "fill".to_string(),
+        source: TradeSource::default(),
     };
     assert!(sender.send(JournalEvent::TradeEvent(trade)));
 

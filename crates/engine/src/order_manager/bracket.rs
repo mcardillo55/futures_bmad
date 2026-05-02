@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use futures_bmad_broker::OrderQueueProducer;
 use futures_bmad_core::{
     BracketOrder, BracketState, BracketStateError, FillEvent, FillType, FixedPrice, OrderEvent,
-    OrderKind, OrderParams, OrderType, RejectReason, Side, UnixNanos,
+    OrderKind, OrderParams, OrderType, RejectReason, Side, TradeSource, UnixNanos,
 };
 use tracing::{debug, error, info, warn};
 
@@ -594,6 +594,7 @@ impl BracketManager {
             price: fill.fill_price,
             size: fill.fill_size,
             kind: exit_kind.to_string(),
+            source: TradeSource::default(),
         };
         self.journal.send(JournalEvent::TradeEvent(trade_record));
 

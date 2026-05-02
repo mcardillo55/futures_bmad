@@ -28,13 +28,16 @@ use futures_bmad_broker::{
     FillQueueConsumer, FillQueueProducer, OrderQueueConsumer, OrderQueueProducer,
     create_order_fill_queues,
 };
-use futures_bmad_core::{BrokerMode, Clock, OrderBook, OrderEvent, SystemClock, UnixNanos};
+use futures_bmad_core::{
+    BrokerMode, Clock, OrderBook, OrderEvent, SystemClock, TradeSource, UnixNanos,
+};
 use futures_bmad_testkit::{MockBehavior, MockBrokerAdapter};
 use tracing::{info, warn};
 
 use crate::order_book::apply_market_event;
 use crate::paper::data_feed::MarketDataFeed;
 use crate::persistence::journal::{EngineEvent as JournalEvent, JournalSender, SystemEventRecord};
+use crate::persistence::query::{JournalQuery, ReadinessReport};
 use crate::replay::fill_sim::{FillModel, MockFillSimulator};
 use crate::spsc::{
     MARKET_EVENT_QUEUE_CAPACITY, MarketEventConsumer, MarketEventProducer, market_event_queue,
@@ -158,7 +161,11 @@ impl<F: MarketDataFeed, C: Clock> PaperTradingOrchestrator<F, C> {
     /// callers go through [`Self::new`] which always picks
     /// [`SystemClock`].
     pub fn with_clock(config: PaperTradingConfig, feed: F, clock: Arc<C>) -> Self {
-        let broker = MockBrokerAdapter::new(MockBehavior::Fill);
+        // Story 7.4 — mock broker is constructed with the Paper source tag
+        // so any wiring code that inspects `broker.source()` sees the right
+        // value at a glance. Actual record stamping happens via the
+        // JournalSender override applied in [`Self::attach_journal`].
+        let broker = MockBrokerAdapter::with_source(MockBehavior::Fill, TradeSource::Paper);
         let capacity = config
             .market_event_capacity
             .unwrap_or(MARKET_EVENT_QUEUE_CAPACITY);
@@ -192,11 +199,26 @@ impl<F: MarketDataFeed, C: Clock> PaperTradingOrchestrator<F, C> {
     /// Attach a [`JournalSender`] so paper-trading runs are recorded into
     /// the same audit trail live trading uses (Story 7.3 Task 8.4).
     ///
+    /// Story 7.4 — the supplied sender is re-tagged with
+    /// [`TradeSource::Paper`] before being stored, so every trade /
+    /// order-state record routed through this orchestrator (and any
+    /// downstream component that received a clone of this sender) is
+    /// stamped `source = "paper"` in the journal. Callers that want a
+    /// non-paper tag (rare; only for crossover tests) should clone and
+    /// override the source themselves before attaching.
+    ///
     /// Optional: when no journal is attached the orchestrator still pumps
-    /// events / orders / fills, but no SQLite persistence happens. Story
-    /// 7.4 will extend this hook to tag entries with `source = "paper"`.
+    /// events / orders / fills, but no SQLite persistence happens.
     pub fn attach_journal(&mut self, journal: JournalSender) {
-        self.journal = Some(journal);
+        self.journal = Some(journal.with_source(TradeSource::Paper));
+    }
+
+    /// Hand a paper-tagged clone of the orchestrator's [`JournalSender`] to
+    /// downstream components (order manager, bracket manager) so their own
+    /// emitted records inherit the same source override. Returns `None` when
+    /// no journal has been attached yet.
+    pub fn journal_sender(&self) -> Option<JournalSender> {
+        self.journal.clone()
     }
 
     /// Subscribe to every symbol listed in [`PaperTradingConfig::subscriptions`]
@@ -217,6 +239,40 @@ impl<F: MarketDataFeed, C: Clock> PaperTradingOrchestrator<F, C> {
             })?;
         }
         Ok(())
+    }
+
+    /// Story 7.4 Task 6.3 — log the paper-trading readiness summary at the
+    /// end of a session.
+    ///
+    /// `conn` is a (read-only) [`rusqlite::Connection`] open against the
+    /// same journal database the orchestrator's [`JournalSender`] writes
+    /// to. The orchestrator does not own this connection (that lives on the
+    /// journal worker thread); callers pass one in once the journal worker
+    /// has flushed.
+    ///
+    /// The summary is informational — the go/no-go decision is human-made,
+    /// per Story 7.4 Task 6.4. A `SystemEvent` is also written to the
+    /// journal so the audit trail records the final readiness snapshot at
+    /// session boundary.
+    pub fn emit_readiness_summary(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> Result<ReadinessReport, crate::persistence::JournalError> {
+        let report = JournalQuery::new(conn).paper_readiness_report()?;
+        info!(
+            target: "paper",
+            summary = %report.fmt_one_line(),
+            "paper trading readiness summary"
+        );
+        if let Some(journal) = self.journal.as_ref() {
+            let rec = SystemEventRecord {
+                timestamp: self.clock.now(),
+                category: "paper_readiness_summary".to_string(),
+                message: report.fmt_one_line(),
+            };
+            let _ = journal.send(JournalEvent::SystemEvent(rec));
+        }
+        Ok(report)
     }
 
     /// Story 7.3 Task 6.1 — emit the startup banner.

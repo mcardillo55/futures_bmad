@@ -3,6 +3,7 @@ mod fixed_price;
 pub mod order;
 pub mod position;
 mod side;
+mod trade_source;
 mod unix_nanos;
 
 pub use bar::Bar;
@@ -14,4 +15,5 @@ pub use order::{
 };
 pub use position::{BrokerPosition, Position};
 pub use side::Side;
+pub use trade_source::TradeSource;
 pub use unix_nanos::UnixNanos;

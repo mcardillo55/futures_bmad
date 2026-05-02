@@ -23,5 +23,5 @@ pub use traits::{
 pub use types::{
     Bar, BracketOrder, BracketOrderError, BracketState, BracketStateError, BrokerPosition,
     FillType, FixedPrice, NonFinitePrice, OrderKind, OrderParams, OrderParamsError, OrderState,
-    OrderStateError, OrderType, Position, RejectReason, Side, UnixNanos,
+    OrderStateError, OrderType, Position, RejectReason, Side, TradeSource, UnixNanos,
 };

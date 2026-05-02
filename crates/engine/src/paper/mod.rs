@@ -40,3 +40,9 @@ pub use data_feed::{MarketDataFeed, VecMarketDataFeed};
 pub use orchestrator::{
     PaperTradingConfig, PaperTradingError, PaperTradingOrchestrator, PaperTradingSummary,
 };
+
+// Re-export the journal query API so paper-mode callers reading session
+// outcomes don't have to reach across module boundaries (Story 7.4).
+pub use crate::persistence::query::{
+    DecisionTrace, JournalQuery, OrderStateRecord, PnlSummary, ReadinessReport, TradeRecord,
+};

@@ -152,7 +152,7 @@ impl ThresholdRegimeDetector {
             let high = curr.high.to_f64();
             let low = curr.low.to_f64();
             let prev_close = prev.close.to_f64();
-            let r1 = high - low;
+            let r1 = (high - low).abs();
             let r2 = (high - prev_close).abs();
             let r3 = (low - prev_close).abs();
             let tr = r1.max(r2).max(r3);
@@ -464,6 +464,35 @@ mod tests {
         // Buffer length should never exceed its initial capacity hint.
         assert!(detector.bar_buffer.len() <= cap_hint);
         assert_eq!(detector.bars_processed(), 1_000);
+    }
+
+    /// Malformed bars where `high < low` must contribute `|high - low|` to
+    /// True Range, not the negative raw difference. Real CME data never
+    /// produces this state, but fuzz/replay corpora (Story 7.2) may not
+    /// enforce that invariant — a missing `.abs()` would silently understate
+    /// True Range when `r1` should dominate.
+    ///
+    /// Constructed so `prev_close` sits between the swapped `high` and
+    /// `low`, making `|h-prev|` and `|l-prev|` both small — `r1` is the
+    /// only term that should produce the correct TR magnitude.
+    #[test]
+    fn compute_atr_handles_malformed_bar_with_low_above_high() {
+        let cfg = ThresholdRegimeConfig {
+            atr_period: 1,
+            ..fast_warmup_config()
+        };
+        let mut detector = ThresholdRegimeDetector::new(cfg);
+        // prev bar: close = 99 (sandwiched between the malformed bar's
+        // swapped high=95 / low=100 so r2 = 4 and r3 = 1).
+        detector.push_bar(mk_bar(99.0, 99.5, 98.5, 99.0, 0));
+        // Malformed bar: high < low. |high - low| = 5.
+        detector.push_bar(mk_bar(98.0, 95.0, 100.0, 97.0, 60));
+        let atr = detector.compute_atr();
+        // With pair_count = 1, ATR == TR of the single pair.
+        // r1 = |95 - 100| = 5, r2 = |95 - 99| = 4, r3 = |100 - 99| = 1.
+        // max = 5. Without `.abs()` on r1 the test would observe 4
+        // (r2 dominates), revealing the silent understatement.
+        assert!((atr - 5.0).abs() < f64::EPSILON, "expected TR=5.0, got {atr}");
     }
 
     #[test]

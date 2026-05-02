@@ -67,14 +67,31 @@ const fn conservative_rank(state: RegimeState) -> u8 {
 pub struct RegimeOrchestrator {
     config: RegimeOrchestrationConfig,
     current_regime: RegimeState,
-    /// Last timestamp at which a transition was acted upon (i.e. moved the
-    /// orchestrator out of cooldown). `None` until the first transition has
-    /// been processed.
+    /// Cooldown anchor — the timestamp of the last transition that *exited*
+    /// cooldown (i.e. updated `current_regime` after the cooldown window
+    /// elapsed, OR the first observed transition out of `Unknown`). `None`
+    /// until the first transition has been processed.
+    ///
+    /// **Single-anchor semantics.** This anchor is set ONLY by transitions
+    /// that exit cooldown. Conservative collapses inside the cooldown branch
+    /// (when `conservative_on_oscillation = true`) DO update `current_regime`
+    /// and `enabled_strategies`, but they DO NOT reset this anchor. By design.
+    ///
+    /// **Why.** The cooldown window is a debounce against rapid classifier
+    /// oscillation. If a conservative collapse reset the anchor, every
+    /// oscillation that flipped into a safer regime would extend the debounce
+    /// indefinitely — a noisy classifier could pin the orchestrator in the
+    /// safer regime forever even if conditions stabilised. Anchoring the
+    /// debounce to the originating acted-upon transition keeps the cooldown
+    /// window bounded and replay-deterministic w.r.t. the inputs that caused
+    /// it.
     last_transition_time: Option<UnixNanos>,
-    /// Transitions observed during cooldown — stored for post-hoc oscillation
-    /// analysis. Bounded only by cooldown windows; in practice this stays
-    /// small because the detector runs at bar cadence.
-    pending_transitions: Vec<RegimeTransition>,
+    /// Number of cooldown-suppressed transitions observed since
+    /// `last_transition_time`. Increments on every suppressed transition
+    /// (including conservative collapses) and resets to `0` whenever a
+    /// transition exits cooldown — bounding the counter at one cooldown
+    /// window's worth of oscillations and making it replay-deterministic.
+    oscillation_count: u32,
     enabled_strategies: HashSet<String>,
     /// Optional journal hand-off; when present, emitted [`RegimeTransition`]
     /// events are forwarded into the engine event journal's
@@ -90,7 +107,7 @@ impl RegimeOrchestrator {
             config,
             current_regime: RegimeState::Unknown,
             last_transition_time: None,
-            pending_transitions: Vec::new(),
+            oscillation_count: 0,
             enabled_strategies: HashSet::new(),
             journal: None,
         }
@@ -127,10 +144,11 @@ impl RegimeOrchestrator {
         self.enabled_strategies.contains(strategy_name)
     }
 
-    /// Snapshot of pending (cooldown-suppressed) transitions for diagnostics
-    /// and tests.
-    pub fn pending_transitions(&self) -> &[RegimeTransition] {
-        &self.pending_transitions
+    /// Number of cooldown-suppressed transitions observed since the last
+    /// acted-upon transition. Resets to `0` whenever a transition exits
+    /// cooldown.
+    pub fn oscillation_count(&self) -> u32 {
+        self.oscillation_count
     }
 
     /// Drive the orchestrator with the latest classifier output.
@@ -166,7 +184,7 @@ impl RegimeOrchestrator {
             // Surface the oscillation through structured logging and the
             // journal but do NOT update the acted-upon regime or the
             // enabled-strategy set.
-            self.pending_transitions.push(transition);
+            self.oscillation_count = self.oscillation_count.saturating_add(1);
             self.log_transition(&transition, true);
             self.forward_to_journal(&transition);
 
@@ -190,6 +208,11 @@ impl RegimeOrchestrator {
         // Cooldown elapsed (or first observed transition): act on it.
         self.current_regime = new_regime;
         self.last_transition_time = Some(timestamp);
+        // Reset the oscillation counter atomically with the anchor advance:
+        // the counter is by definition "suppressed transitions since the
+        // anchor", and the anchor just moved. Replay determinism depends on
+        // this reset happening here (not on entry, not in `is_in_cooldown`).
+        self.oscillation_count = 0;
         self.apply_strategy_permissions(new_regime);
         self.log_transition(&transition, false);
         self.forward_to_journal(&transition);
@@ -382,7 +405,8 @@ mod tests {
         assert_eq!(orch.enabled_strategies(), &baseline);
     }
 
-    /// 7.6 — Rapid oscillation is still surfaced (transition event returned).
+    /// 7.6 — Rapid oscillation is still surfaced (transition event returned)
+    /// and the oscillation counter increments.
     #[test]
     fn oscillation_in_cooldown_still_returns_transition() {
         let clock = SimClock::new(0);
@@ -392,8 +416,40 @@ mod tests {
         let suppressed = suppressed.expect("transition still emitted");
         assert_eq!(suppressed.from, RegimeState::Trending);
         assert_eq!(suppressed.to, RegimeState::Rotational);
-        // And it shows up in pending_transitions.
-        assert_eq!(orch.pending_transitions().len(), 1);
+        // And the oscillation counter records the suppression.
+        assert_eq!(orch.oscillation_count(), 1);
+    }
+
+    /// `oscillation_count` resets to 0 when a transition exits cooldown.
+    /// Determinism guarantee: the counter is bounded by one cooldown
+    /// window's worth of oscillations and recovers identically across
+    /// replay runs.
+    #[test]
+    fn oscillation_count_resets_after_cooldown_expiry() {
+        let clock = SimClock::new(0);
+        let mut orch = RegimeOrchestrator::new(test_config(60, false));
+        // Acted-upon transition at t=10s — anchors the cooldown window.
+        orch.on_regime_update(RegimeState::Trending, ts_secs(10), &clock);
+        assert_eq!(orch.oscillation_count(), 0);
+
+        // Three suppressed transitions within the 60s cooldown window.
+        // Each proposed regime must DIFFER from current_regime (Trending) —
+        // a same-regime update short-circuits before the cooldown branch.
+        // current_regime stays Trending throughout suppression because
+        // conservative_on_oscillation = false.
+        orch.on_regime_update(RegimeState::Rotational, ts_secs(20), &clock);
+        orch.on_regime_update(RegimeState::Volatile, ts_secs(30), &clock);
+        orch.on_regime_update(RegimeState::Rotational, ts_secs(40), &clock);
+        assert_eq!(orch.oscillation_count(), 3);
+        // Anchor untouched while in cooldown; current_regime untouched.
+        assert_eq!(orch.current_regime(), RegimeState::Trending);
+
+        // Advance past the cooldown window — the next transition exits
+        // cooldown and the counter must reset atomically with the anchor
+        // advance.
+        orch.on_regime_update(RegimeState::Rotational, ts_secs(80), &clock);
+        assert_eq!(orch.current_regime(), RegimeState::Rotational);
+        assert_eq!(orch.oscillation_count(), 0);
     }
 
     /// 7.7 — After cooldown elapses, the next transition is acted upon.
@@ -477,14 +533,20 @@ mod tests {
         let mut orch = RegimeOrchestrator::new(test_config(300, true));
         orch.on_regime_update(RegimeState::Trending, ts_secs(10), &clock);
         assert!(orch.is_strategy_enabled("trend_strategy"));
+        assert_eq!(orch.oscillation_count(), 0);
         // Within cooldown, propose Volatile — more conservative.
         orch.on_regime_update(RegimeState::Volatile, ts_secs(20), &clock);
         assert_eq!(orch.current_regime(), RegimeState::Volatile);
         assert!(!orch.is_strategy_enabled("trend_strategy"));
+        // Counter increments on the suppressed-but-collapsed transition.
+        assert_eq!(orch.oscillation_count(), 1);
         // ...but propose Rotational (less conservative than Volatile) and
         // we should NOT degrade further.
         orch.on_regime_update(RegimeState::Rotational, ts_secs(30), &clock);
         assert_eq!(orch.current_regime(), RegimeState::Volatile);
+        // Counter still increments — every suppressed transition counts,
+        // collapse or no collapse.
+        assert_eq!(orch.oscillation_count(), 2);
     }
 
     /// `is_more_conservative` honours the documented ordering.

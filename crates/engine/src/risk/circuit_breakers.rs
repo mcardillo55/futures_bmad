@@ -443,7 +443,9 @@ impl CircuitBreakers {
         if let Some(sender) = &self.alerts
             && matches!(breaker_type.category(), BreakerCategory::Breaker)
         {
-            let snapshot = position.clone().unwrap_or_else(PositionSnapshot::flat_unknown);
+            let snapshot = position
+                .clone()
+                .unwrap_or_else(PositionSnapshot::flat_unknown);
             sender.send(Alert::for_breaker(
                 breaker_type,
                 reason.clone(),
@@ -990,9 +992,7 @@ impl CircuitBreakers {
         }
 
         // Tier 3: 95% — trip the BufferOverflow breaker (manual reset).
-        if pct >= BUFFER_BREAK_PCT
-            && matches!(self.buffer_overflow_state, BreakerState::Active)
-        {
+        if pct >= BUFFER_BREAK_PCT && matches!(self.buffer_overflow_state, BreakerState::Active) {
             self.trip_breaker(
                 BreakerType::BufferOverflow,
                 format!("buffer occupancy {pct:.1}% reached 95% threshold"),
@@ -1190,7 +1190,9 @@ impl CircuitBreakers {
             let count = self.malformed_window.len();
             self.trip_breaker(
                 BreakerType::MalformedMessages,
-                format!("{count} malformed messages in 60s window (threshold {MALFORMED_THRESHOLD})"),
+                format!(
+                    "{count} malformed messages in 60s window (threshold {MALFORMED_THRESHOLD})"
+                ),
                 journal_ts,
             );
         }
@@ -1203,11 +1205,7 @@ impl CircuitBreakers {
     /// breaker is appropriate, not a gate, because in-flight broker state
     /// may be corrupt after a failed reconciliation — the operator must
     /// confirm the world is consistent before resuming.
-    pub fn on_connection_state_change(
-        &mut self,
-        new_state: ConnectionState,
-        timestamp: UnixNanos,
-    ) {
+    pub fn on_connection_state_change(&mut self, new_state: ConnectionState, timestamp: UnixNanos) {
         if matches!(new_state, ConnectionState::CircuitBreak)
             && matches!(self.connection_failure_state, BreakerState::Active)
         {
@@ -1588,11 +1586,7 @@ mod tests {
     #[test]
     fn breaker_trip_without_alert_sender_is_silent() {
         let (mut cb, _journal) = fixture();
-        cb.trip_breaker(
-            BreakerType::DailyLoss,
-            "loss".into(),
-            UnixNanos::new(1),
-        );
+        cb.trip_breaker(BreakerType::DailyLoss, "loss".into(), UnixNanos::new(1));
         // Compiles and runs without panicking.
     }
 
@@ -1600,16 +1594,8 @@ mod tests {
     #[test]
     fn idempotent_trip_does_not_double_alert() {
         let (mut cb, _journal, alerts_rx) = alerting_fixture();
-        cb.trip_breaker(
-            BreakerType::DailyLoss,
-            "first".into(),
-            UnixNanos::new(1),
-        );
-        cb.trip_breaker(
-            BreakerType::DailyLoss,
-            "second".into(),
-            UnixNanos::new(2),
-        );
+        cb.trip_breaker(BreakerType::DailyLoss, "first".into(), UnixNanos::new(1));
+        cb.trip_breaker(BreakerType::DailyLoss, "second".into(), UnixNanos::new(2));
         // First trip emits, second is a no-op.
         assert!(alerts_rx.try_recv().is_ok());
         assert!(alerts_rx.try_recv().is_err());
@@ -1883,10 +1869,7 @@ mod tests {
 
         // 10 arrivals — must NOT trip (threshold is `>10`).
         for i in 0..10u64 {
-            cb.record_malformed_message(
-                t0 + Duration::from_millis(i * 100),
-                UnixNanos::new(i),
-            );
+            cb.record_malformed_message(t0 + Duration::from_millis(i * 100), UnixNanos::new(i));
         }
         assert_eq!(
             cb.state(BreakerType::MalformedMessages),
@@ -1894,10 +1877,7 @@ mod tests {
         );
 
         // 11th arrival — must trip.
-        cb.record_malformed_message(
-            t0 + Duration::from_millis(1100),
-            UnixNanos::new(99),
-        );
+        cb.record_malformed_message(t0 + Duration::from_millis(1100), UnixNanos::new(99));
         assert_eq!(
             cb.state(BreakerType::MalformedMessages),
             BreakerState::Tripped
@@ -2078,10 +2058,7 @@ mod tests {
         // 11 arrivals, each 7 seconds apart — total 70s span. Window is
         // 60s, so no point in time has more than ~9 in window.
         for i in 0..11u64 {
-            cb.record_malformed_message(
-                t0 + Duration::from_secs(i * 7),
-                UnixNanos::new(i),
-            );
+            cb.record_malformed_message(t0 + Duration::from_secs(i * 7), UnixNanos::new(i));
             assert_eq!(
                 cb.state(BreakerType::MalformedMessages),
                 BreakerState::Active,
@@ -2128,10 +2105,7 @@ mod tests {
         cb.check_fee_staleness(sched_old, today, UnixNanos::new(3));
         // Trip MalformedMessages (11 in window).
         for i in 0..11 {
-            cb.record_malformed_message(
-                t0 + Duration::from_millis(i * 100),
-                UnixNanos::new(i + 4),
-            );
+            cb.record_malformed_message(t0 + Duration::from_millis(i * 100), UnixNanos::new(i + 4));
         }
         // Trip ConnectionFailure.
         cb.on_connection_state_change(ConnectionState::CircuitBreak, UnixNanos::new(20));
@@ -2219,10 +2193,7 @@ mod tests {
         let (mut cb, _rx) = fixture();
         let t0 = Instant::now();
         for i in 0..11 {
-            cb.record_malformed_message(
-                t0 + Duration::from_millis(i * 100),
-                UnixNanos::new(i),
-            );
+            cb.record_malformed_message(t0 + Duration::from_millis(i * 100), UnixNanos::new(i));
         }
         assert_eq!(
             cb.state(BreakerType::MalformedMessages),
@@ -2230,10 +2201,7 @@ mod tests {
         );
 
         // Window goes idle — but breaker stays tripped.
-        cb.record_malformed_message(
-            t0 + Duration::from_secs(120),
-            UnixNanos::new(99),
-        );
+        cb.record_malformed_message(t0 + Duration::from_secs(120), UnixNanos::new(99));
         assert_eq!(
             cb.state(BreakerType::MalformedMessages),
             BreakerState::Tripped

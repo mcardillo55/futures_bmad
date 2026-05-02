@@ -40,8 +40,8 @@ use futures_bmad_core::BreakerType;
 
 pub use alerting::{
     ALERT_CHANNEL_CAPACITY, Alert, AlertManager, AlertReceiver, AlertSender, AlertSeverity,
-    BreakerKind, DEFAULT_SCRIPT_TIMEOUT, FlattenAttemptDetail, PositionSnapshot,
-    SharedAlertSender, alert_channel,
+    BreakerKind, DEFAULT_SCRIPT_TIMEOUT, FlattenAttemptDetail, PositionSnapshot, SharedAlertSender,
+    alert_channel,
 };
 pub use anomaly_handler::{AnomalyResolution, handle_anomaly};
 // Re-export the broker-side `FlattenRequest` so producers (Story 5.3
@@ -49,10 +49,10 @@ pub use anomaly_handler::{AnomalyResolution, handle_anomaly};
 // single import path. The struct itself remains owned by
 // `futures_bmad_broker::position_flatten` — re-exporting keeps the seam
 // stable across crate boundaries.
-pub use futures_bmad_broker::FlattenRequest;
 pub use circuit_breakers::{AnomalyCheckOutcome, CircuitBreakers, ConnectionState};
 pub use event_windows::{ActiveEvent, EventWindowManager, TradingRestriction};
 pub use fee_gate::{FeeGate, FeeGateReason};
+pub use futures_bmad_broker::FlattenRequest;
 pub use panic_mode::{ActivationOutcome, OrderCancellation, PanicContext, PanicMode, PanicState};
 
 /// One specific reason `permits_trading()` denied a trade.

@@ -448,8 +448,8 @@ mod tests {
     #[tokio::test]
     async fn flatten_result_returns_all_attempts_failed_after_three_rejections() {
         let submitter = ScriptedSubmitter::new(10, SubmissionError::ExchangeReject);
-        let retry = PositionFlattener::new(&submitter)
-            .with_retry_interval(Duration::from_millis(1));
+        let retry =
+            PositionFlattener::new(&submitter).with_retry_interval(Duration::from_millis(1));
 
         let outcome = retry.flatten(req()).await;
         match outcome {
@@ -473,8 +473,8 @@ mod tests {
     #[tokio::test]
     async fn flatten_result_ok_after_retries() {
         let submitter = ScriptedSubmitter::new(2, SubmissionError::ConnectionLost);
-        let retry = PositionFlattener::new(&submitter)
-            .with_retry_interval(Duration::from_millis(1));
+        let retry =
+            PositionFlattener::new(&submitter).with_retry_interval(Duration::from_millis(1));
         let outcome = retry.flatten(req()).await;
         assert!(matches!(outcome, Ok(())));
         assert_eq!(submitter.attempts(), 3);

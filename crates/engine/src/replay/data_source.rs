@@ -52,9 +52,7 @@ pub enum ReplaySourceError {
     Parquet(PathBuf, String),
     #[error("schema mismatch in {0}: missing column `{1}`")]
     MissingColumn(PathBuf, String),
-    #[error(
-        "schema mismatch in {0}: column `{1}` has type {2:?}, expected {3:?}"
-    )]
+    #[error("schema mismatch in {0}: column `{1}` has type {2:?}, expected {3:?}")]
     WrongColumnType(PathBuf, String, DataType, DataType),
     #[error("no Parquet files found in directory {0}")]
     EmptyDirectory(PathBuf),
@@ -284,7 +282,9 @@ mod tests {
         let mut writer = MarketDataWriter::new(dir.path().to_path_buf(), "MES".into());
         let ts0 = 1_776_470_400_000_000_000u64;
         for i in 0..5u64 {
-            writer.write_event(&make_event(ts0 + i * 1_000_000, 18_000 + i as i64)).unwrap();
+            writer
+                .write_event(&make_event(ts0 + i * 1_000_000, 18_000 + i as i64))
+                .unwrap();
         }
         writer.flush().unwrap();
 
@@ -313,7 +313,8 @@ mod tests {
         {
             let mut w1 = MarketDataWriter::new(dir.path().to_path_buf(), "MES".into());
             w1.write_event(&make_event(ts1, 18_000)).unwrap();
-            w1.write_event(&make_event(ts1 + 1_000_000, 18_001)).unwrap();
+            w1.write_event(&make_event(ts1 + 1_000_000, 18_001))
+                .unwrap();
             w1.flush().unwrap();
         }
         let ts2 = ts1 + 86_400_000_000_000;
@@ -377,7 +378,7 @@ mod tests {
     /// 2.5b — schema validation on a column with wrong type fails fast.
     #[test]
     fn open_rejects_file_with_wrong_column_type() {
-        use arrow::array::{Float64Array, Int64Array, Int8Array, UInt32Array};
+        use arrow::array::{Float64Array, Int8Array, Int64Array, UInt32Array};
         use arrow::datatypes::{Field, Schema};
         use arrow::record_batch::RecordBatch;
         use parquet::arrow::ArrowWriter;

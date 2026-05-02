@@ -149,9 +149,8 @@ pub fn generate_test_events() -> Vec<MarketEvent> {
 fn ensure_dataset() -> PathBuf {
     let dir = data_dir();
     let date = NaiveDate::from_ymd_opt(TEST_DATE.0, TEST_DATE.1, TEST_DATE.2).unwrap();
-    let target = futures_bmad_engine::persistence::parquet_writer::file_path_for(
-        &dir, SYMBOL, date,
-    );
+    let target =
+        futures_bmad_engine::persistence::parquet_writer::file_path_for(&dir, SYMBOL, date);
     if !target.exists() {
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         let mut writer = MarketDataWriter::new(dir.clone(), SYMBOL.to_string());
@@ -382,11 +381,11 @@ fn snapshot_interval_comparison() {
 /// re-export to confirm the API surface is consumer-usable.
 #[test]
 fn assert_helpers_are_publicly_callable() {
+    use futures_bmad_core::RegimeState;
     use futures_bmad_engine::replay::{
         DEFAULT_SIGNAL_EPSILON, assert_fixed_price_identical, assert_regime_identical,
         assert_signal_epsilon,
     };
-    use futures_bmad_core::RegimeState;
 
     assert_fixed_price_identical(FixedPrice::new(42), FixedPrice::new(42));
     assert_signal_epsilon(0.5, 0.5, DEFAULT_SIGNAL_EPSILON);

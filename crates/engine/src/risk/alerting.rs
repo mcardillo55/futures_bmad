@@ -90,10 +90,7 @@ impl PositionSnapshot {
     }
 }
 
-fn serialize_side_opt<S: serde::Serializer>(
-    side: &Option<Side>,
-    s: S,
-) -> Result<S::Ok, S::Error> {
+fn serialize_side_opt<S: serde::Serializer>(side: &Option<Side>, s: S) -> Result<S::Ok, S::Error> {
     match side {
         Some(Side::Buy) => s.serialize_str("buy"),
         Some(Side::Sell) => s.serialize_str("sell"),
@@ -298,12 +295,12 @@ impl AlertManager {
     ///
     /// `receiver` is the consumer end of [`alert_channel`]; the matching
     /// [`AlertSender`] is held by upstream producers.
-    pub fn from_config(
-        config: &AlertingConfig,
-        receiver: AlertReceiver,
-    ) -> std::io::Result<Self> {
-        let manager =
-            AlertManager::new(&config.alert_log_path, config.alert_script_path.as_ref(), receiver)?;
+    pub fn from_config(config: &AlertingConfig, receiver: AlertReceiver) -> std::io::Result<Self> {
+        let manager = AlertManager::new(
+            &config.alert_log_path,
+            config.alert_script_path.as_ref(),
+            receiver,
+        )?;
         Ok(manager.with_script_timeout(Duration::from_millis(config.alert_script_timeout_ms)))
     }
 

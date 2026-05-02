@@ -67,9 +67,7 @@
 
 use std::sync::Arc;
 
-use futures_bmad_broker::{
-    FlattenError, FlattenRequest, OrderSubmitter, PositionFlattener,
-};
+use futures_bmad_broker::{FlattenError, FlattenRequest, OrderSubmitter, PositionFlattener};
 use futures_bmad_core::{Side, UnixNanos};
 use tracing::{error, info, warn};
 
@@ -311,8 +309,8 @@ mod tests {
     #[tokio::test]
     async fn flatten_failure_activates_panic_mode_with_context() {
         let submitter = AlwaysFail::new(SubmissionError::ExchangeReject);
-        let flattener = PositionFlattener::new(&submitter)
-            .with_retry_interval(Duration::from_millis(1));
+        let flattener =
+            PositionFlattener::new(&submitter).with_retry_interval(Duration::from_millis(1));
         let (sender, receiver) = EventJournal::channel();
         let pm = Arc::new(PanicMode::new(sender));
         let mut cancel = CountingCancellation::default();
@@ -332,8 +330,14 @@ mod tests {
             }
             other => panic!("expected PanicActivated, got {other:?}"),
         }
-        assert!(pm.is_active(), "panic mode MUST be active after flatten failure");
-        assert_eq!(cancel.invocations, 1, "cancel_entries_and_limits called once");
+        assert!(
+            pm.is_active(),
+            "panic mode MUST be active after flatten failure"
+        );
+        assert_eq!(
+            cancel.invocations, 1,
+            "cancel_entries_and_limits called once"
+        );
 
         // Inspect journal: a SystemEvent for the panic_mode category was
         // recorded. The per-attempt detail flows through the operator-alert
@@ -360,8 +364,8 @@ mod tests {
     #[tokio::test]
     async fn second_invocation_after_panic_returns_already_in_panic() {
         let submitter = AlwaysFail::new(SubmissionError::ExchangeReject);
-        let flattener = PositionFlattener::new(&submitter)
-            .with_retry_interval(Duration::from_millis(1));
+        let flattener =
+            PositionFlattener::new(&submitter).with_retry_interval(Duration::from_millis(1));
         let pm = Arc::new(PanicMode::new(journal()));
         let mut cancel = CountingCancellation::default();
 

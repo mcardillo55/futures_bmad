@@ -34,15 +34,13 @@ use tracing::{info, warn};
 
 use crate::data::data_source::DataSource;
 use crate::order_book::apply_market_event;
-use crate::persistence::journal::{
-    EngineEvent as JournalEvent, JournalSender, SystemEventRecord,
-};
+use crate::persistence::journal::{EngineEvent as JournalEvent, JournalSender, SystemEventRecord};
 use crate::regime::ThresholdRegimeConfig;
 use crate::regime::ThresholdRegimeDetector;
 use crate::replay::data_source::{ParquetReplaySource, ReplaySourceError};
 use crate::replay::determinism::{
-    DeterminismReport, FixedPriceMismatch, RegimeMismatch, SignalMismatch, SnapshotMismatch,
-    DEFAULT_SIGNAL_EPSILON,
+    DEFAULT_SIGNAL_EPSILON, DeterminismReport, FixedPriceMismatch, RegimeMismatch, SignalMismatch,
+    SnapshotMismatch,
 };
 use crate::replay::fill_sim::{FillModel, MockFillSimulator};
 use crate::signals::SignalPipeline;
@@ -222,11 +220,7 @@ impl ReplayResult {
     /// Variant of [`Self::compare`] that takes an explicit epsilon. Useful
     /// in tests asserting that a tightened/relaxed tolerance still detects
     /// the expected mismatches.
-    pub fn compare_with_epsilon(
-        &self,
-        other: &ReplayResult,
-        epsilon: f64,
-    ) -> DeterminismReport {
+    pub fn compare_with_epsilon(&self, other: &ReplayResult, epsilon: f64) -> DeterminismReport {
         let mut report = DeterminismReport::default();
 
         // Length parity is itself a determinism violation — record it as a
@@ -279,7 +273,13 @@ impl ReplayResult {
 
         let n_snap = self.snapshots.len().min(other.snapshots.len());
         for i in 0..n_snap {
-            compare_snapshot(&self.snapshots[i], &other.snapshots[i], i, epsilon, &mut report);
+            compare_snapshot(
+                &self.snapshots[i],
+                &other.snapshots[i],
+                i,
+                epsilon,
+                &mut report,
+            );
         }
 
         report.finalize();
@@ -363,10 +363,7 @@ fn compare_snapshot(
                 snapshot_index,
                 signal: sig_a.name.clone(),
                 field: "timestamp".to_string(),
-                detail: format!(
-                    "a={} vs b={}",
-                    sig_a.timestamp_nanos, sig_b.timestamp_nanos
-                ),
+                detail: format!("a={} vs b={}", sig_a.timestamp_nanos, sig_b.timestamp_nanos),
             });
         }
         match (sig_a.value, sig_b.value) {
@@ -485,12 +482,8 @@ impl TradeStats {
             let close_qty = remaining.min(leg.qty);
             // P&L: long leg => (exit - entry); short leg => (entry - exit).
             let leg_pnl_qt = match leg.side {
-                futures_bmad_core::Side::Buy => {
-                    fill.fill_price.raw() - leg.price.raw()
-                }
-                futures_bmad_core::Side::Sell => {
-                    leg.price.raw() - fill.fill_price.raw()
-                }
+                futures_bmad_core::Side::Buy => fill.fill_price.raw() - leg.price.raw(),
+                futures_bmad_core::Side::Sell => leg.price.raw() - fill.fill_price.raw(),
             } * close_qty as i64;
             self.cumulative_pnl_qt = self.cumulative_pnl_qt.saturating_add(leg_pnl_qt);
             self.total_trades += 1;
@@ -1080,10 +1073,7 @@ impl ReplayOrchestrator {
 /// a `reset()` implementation that fails to clear all internal state — an
 /// EPIC-7 determinism breaker that this assertion catches before any events
 /// are processed.
-fn assert_initial_pipeline_state(
-    pipeline: &SignalPipeline,
-    sig_cfg: &SignalInstrumentationConfig,
-) {
+fn assert_initial_pipeline_state(pipeline: &SignalPipeline, sig_cfg: &SignalInstrumentationConfig) {
     let reference = SignalPipeline::new(
         sig_cfg.obi_warmup,
         FixedPrice::new(sig_cfg.max_spread_qt),
@@ -1097,11 +1087,7 @@ fn assert_initial_pipeline_state(
     assert_signal_initial(&actual.microprice, &expected.microprice, "microprice");
 }
 
-fn assert_signal_initial(
-    actual: &SignalSnapshot,
-    expected: &SignalSnapshot,
-    name: &str,
-) {
+fn assert_signal_initial(actual: &SignalSnapshot, expected: &SignalSnapshot, name: &str) {
     assert_eq!(
         actual.value, expected.value,
         "{name}: post-reset value should match a freshly-constructed signal"
@@ -1452,8 +1438,7 @@ mod tests {
         );
 
         let symbol_dir = dir.path().join("market").join("MES");
-        let mut orch =
-            ReplayOrchestrator::new(ReplayConfig::new(symbol_dir.clone())).unwrap();
+        let mut orch = ReplayOrchestrator::new(ReplayConfig::new(symbol_dir.clone())).unwrap();
         let summary = orch.run();
         assert_eq!(summary.total_events, 2);
         // Last event is from day 2 ⇒ clock advanced through both.

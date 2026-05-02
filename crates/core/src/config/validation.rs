@@ -9,23 +9,38 @@ pub enum ConfigValidationError {
     NegativeDailyLoss,
     NegativeFee(String),
     NonFiniteValue(String),
-    FeeScheduleStale { days_old: i64 },
-    FeeScheduleExpired { days_old: i64 },
+    FeeScheduleStale {
+        days_old: i64,
+    },
+    FeeScheduleExpired {
+        days_old: i64,
+    },
     FeeScheduleFuture,
     InvalidDateFormat(String),
     EmptyField(String),
-    InvalidFormat { field: String, expected: String },
+    InvalidFormat {
+        field: String,
+        expected: String,
+    },
     ZeroTimeout(String),
     NegativeSpreadThreshold,
     ZeroMaxTradesPerDay,
     /// Event window must specify exactly one of `end` or `duration_minutes`.
-    EventWindowEndOrDurationRequired { name: String },
+    EventWindowEndOrDurationRequired {
+        name: String,
+    },
     /// Event window cannot specify both `end` and `duration_minutes`.
-    EventWindowEndAndDurationConflict { name: String },
+    EventWindowEndAndDurationConflict {
+        name: String,
+    },
     /// Event window's resolved end <= start (zero-or-negative duration).
-    EventWindowNonPositiveDuration { name: String },
+    EventWindowNonPositiveDuration {
+        name: String,
+    },
     /// `duration_minutes = 0` is not a valid event window.
-    EventWindowZeroDuration { name: String },
+    EventWindowZeroDuration {
+        name: String,
+    },
 }
 
 impl std::fmt::Display for ConfigValidationError {

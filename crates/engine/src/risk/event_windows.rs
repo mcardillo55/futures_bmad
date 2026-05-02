@@ -143,7 +143,10 @@ impl EventWindowManager {
     /// start, both end and duration set, neither set) are silently
     /// dropped — caller is expected to have run validation first.
     pub fn new(configs: &[EventWindowConfig]) -> Self {
-        let windows = configs.iter().filter_map(ResolvedWindow::from_config).collect();
+        let windows = configs
+            .iter()
+            .filter_map(ResolvedWindow::from_config)
+            .collect();
         Self { windows }
     }
 
@@ -191,8 +194,7 @@ impl EventWindowManager {
                     );
                 }
                 (true, false) => {
-                    let duration_secs =
-                        (window.end - window.start).num_seconds().max(0);
+                    let duration_secs = (window.end - window.start).num_seconds().max(0);
                     info!(
                         target: "event_windows",
                         event_name = %window.name,
@@ -411,8 +413,7 @@ mod tests {
     /// 7.8 (variant) — ReduceExposure beats DisableStrategies.
     #[test]
     fn reduce_exposure_beats_disable_strategies() {
-        let mut mgr =
-            EventWindowManager::new(&[cpi_end_event(), nfp_reduce_event()]);
+        let mut mgr = EventWindowManager::new(&[cpi_end_event(), nfp_reduce_event()]);
         // CPI alone (DisableStrategies) at 8:45.
         let only_cpi = Utc.with_ymd_and_hms(2026, 5, 13, 8, 45, 0).unwrap();
         let clock_cpi = sim_at(only_cpi);

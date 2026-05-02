@@ -12,9 +12,7 @@ use crate::data_quality::{
 };
 use crate::order_book::apply_market_event;
 use crate::order_manager::tracker::PositionTracker;
-use crate::persistence::journal::{
-    EngineEvent as JournalEvent, JournalSender, SystemEventRecord,
-};
+use crate::persistence::journal::{EngineEvent as JournalEvent, JournalSender, SystemEventRecord};
 use crate::risk::circuit_breakers::AnomalyCheckOutcome;
 use crate::risk::{CircuitBreakers, EventWindowManager, TradingRestriction};
 use crate::spsc::MarketEventConsumer;
@@ -200,11 +198,7 @@ impl<C: Clock> EventLoop<C> {
     /// `OrderBook::is_tradeable()` — supplied here so the breaker plumbing
     /// has the production trading-config value without the event loop
     /// needing to own a full [`futures_bmad_core::TradingConfig`].
-    pub fn attach_circuit_breakers(
-        &mut self,
-        breakers: CircuitBreakers,
-        max_spread: FixedPrice,
-    ) {
+    pub fn attach_circuit_breakers(&mut self, breakers: CircuitBreakers, max_spread: FixedPrice) {
         self.breakers = Some(breakers);
         self.book_guards = Some(BookGuards { max_spread });
     }
@@ -368,8 +362,7 @@ impl<C: Clock> EventLoop<C> {
         // tick — otherwise we'd flap the gate based on a stale view of
         // the book.
         if event_processed_this_tick
-            && let (Some(breakers), Some(guards)) =
-                (self.breakers.as_mut(), self.book_guards)
+            && let (Some(breakers), Some(guards)) = (self.breakers.as_mut(), self.book_guards)
         {
             let wall_now = self.clock.now().as_nanos();
             let market_open = self.clock.is_market_open();
@@ -378,12 +371,7 @@ impl<C: Clock> EventLoop<C> {
                 .check_stale(wall_now, market_open)
                 .is_some();
             let is_tradeable = self.book.is_tradeable(guards.max_spread);
-            breakers.update_data_quality(
-                is_tradeable,
-                had_seq_gap,
-                is_stale,
-                self.clock.now(),
-            );
+            breakers.update_data_quality(is_tradeable, had_seq_gap, is_stale, self.clock.now());
         }
 
         // Pre-Epic-6 cleanup D-2: per-tick anomaly check producer. Runs
@@ -399,17 +387,10 @@ impl<C: Clock> EventLoop<C> {
                 self.gate
                     .activate(&GateReason::StaleData { gap_nanos }, now);
                 // Mirror into the breaker framework as well.
-                if let (Some(breakers), Some(guards)) =
-                    (self.breakers.as_mut(), self.book_guards)
-                {
+                if let (Some(breakers), Some(guards)) = (self.breakers.as_mut(), self.book_guards) {
                     let is_tradeable = self.book.is_tradeable(guards.max_spread);
                     let _ = gap_nanos; // surface; structure is logged by gate.activate
-                    breakers.update_data_quality(
-                        is_tradeable,
-                        false,
-                        true,
-                        self.clock.now(),
-                    );
+                    breakers.update_data_quality(is_tradeable, false, true, self.clock.now());
                 }
             }
         }
@@ -465,7 +446,8 @@ impl<C: Clock> EventLoop<C> {
                 now_ts,
             );
             if let AnomalyCheckOutcome::Anomalous {
-                current_position: cur, ..
+                current_position: cur,
+                ..
             } = outcome
             {
                 // Build flatten request: side opposite of existing
@@ -510,7 +492,11 @@ impl<C: Clock> EventLoop<C> {
                                 ),
                             };
                             if !journal.send(JournalEvent::SystemEvent(rec)) {
-                                tracing::error!(target = "audit_loss", category = "flatten_request_dropped", "journal queue full — audit record lost");
+                                tracing::error!(
+                                    target = "audit_loss",
+                                    category = "flatten_request_dropped",
+                                    "journal queue full — audit record lost"
+                                );
                             }
                         }
                     }
@@ -531,11 +517,17 @@ impl<C: Clock> EventLoop<C> {
                                 ),
                             };
                             if !journal.send(JournalEvent::SystemEvent(rec)) {
-                                tracing::error!(target = "audit_loss", category = "flatten_request_dropped", "journal queue full — audit record lost");
+                                tracing::error!(
+                                    target = "audit_loss",
+                                    category = "flatten_request_dropped",
+                                    "journal queue full — audit record lost"
+                                );
                             }
                         }
                         self.flatten_tx = None;
-                        tracing::warn!("FlattenRequest channel closed — anomaly producer disabled until reattached");
+                        tracing::warn!(
+                            "FlattenRequest channel closed — anomaly producer disabled until reattached"
+                        );
                         break; // stop iterating positions; no consumer to receive any more
                     }
                 }
@@ -778,8 +770,7 @@ mod tests {
     fn with_event_windows_loads_configs() {
         let (_producer, consumer) = market_event_queue(16);
         let clock = SimClock::new(BASE_TS);
-        let event_loop =
-            EventLoop::with_event_windows(consumer, clock, 3.0, &[fomc_window()]);
+        let event_loop = EventLoop::with_event_windows(consumer, clock, 3.0, &[fomc_window()]);
         assert_eq!(event_loop.event_window_count(), 1);
     }
 
@@ -793,8 +784,7 @@ mod tests {
         let nanos = inside.timestamp_nanos_opt().unwrap() as u64;
         let clock = SimClock::new(nanos);
 
-        let mut event_loop =
-            EventLoop::with_event_windows(consumer, clock, 3.0, &[fomc_window()]);
+        let mut event_loop = EventLoop::with_event_windows(consumer, clock, 3.0, &[fomc_window()]);
         assert_eq!(
             event_loop.current_trading_restriction(),
             Some(TradingRestriction::SitOut)
@@ -813,8 +803,7 @@ mod tests {
         let nanos = inside.timestamp_nanos_opt().unwrap() as u64;
         let clock = SimClock::new(nanos);
 
-        let mut event_loop =
-            EventLoop::with_event_windows(consumer, clock, 3.0, &[fomc_window()]);
+        let mut event_loop = EventLoop::with_event_windows(consumer, clock, 3.0, &[fomc_window()]);
 
         producer.try_push(make_bid(18000, 50, nanos));
         let state = event_loop.tick();
@@ -839,9 +828,9 @@ mod tests {
     use futures_bmad_core::{BreakerState, BreakerType, TradingConfig};
 
     fn breakers_for_test() -> CircuitBreakers {
-        use std::sync::Arc;
         use crate::persistence::journal::EventJournal;
         use crate::risk::panic_mode::PanicMode;
+        use std::sync::Arc;
 
         let cfg = TradingConfig {
             symbol: "ES".into(),
@@ -957,9 +946,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     use crate::order_manager::tracker::PositionTracker;
-    use crate::persistence::journal::{
-        EngineEvent as TestJournalEvent, EventJournal,
-    };
+    use crate::persistence::journal::{EngineEvent as TestJournalEvent, EventJournal};
     use futures_bmad_core::FillType;
 
     fn fill_buy(qty: u32) -> futures_bmad_core::FillEvent {

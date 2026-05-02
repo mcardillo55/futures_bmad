@@ -105,7 +105,10 @@ fn main() -> ExitCode {
         "recorded (s):     {:.3}",
         summary.recorded_duration_nanos as f64 / 1e9
     );
-    println!("speed multiple:   {:.1}x real-time", summary.replay_speed_multiple);
+    println!(
+        "speed multiple:   {:.1}x real-time",
+        summary.replay_speed_multiple
+    );
 
     ExitCode::SUCCESS
 }

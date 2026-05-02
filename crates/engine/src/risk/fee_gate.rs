@@ -80,10 +80,7 @@ impl FeeGate {
     /// `BreakerType::FeeStaleness`. The previously-retained `clock`
     /// parameter has been dropped — there is no economics-time-of-day
     /// branch in this gate today.
-    pub fn permits_trade(
-        &self,
-        expected_edge: FixedPrice,
-    ) -> Result<bool, FeeGateReason> {
+    pub fn permits_trade(&self, expected_edge: FixedPrice) -> Result<bool, FeeGateReason> {
         // Compute minimum edge threshold
         let cost = self.total_round_trip_cost();
         let threshold_f64 = self.minimum_edge_multiple * cost.to_f64();

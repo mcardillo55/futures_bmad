@@ -28,9 +28,8 @@ pub mod orchestrator;
 
 pub use data_source::{ParquetReplaySource, ReplaySourceError};
 pub use determinism::{
-    DeterminismReport, FixedPriceMismatch, RegimeMismatch, SignalMismatch, SnapshotMismatch,
-    assert_fixed_price_identical, assert_regime_identical, assert_signal_epsilon,
-    DEFAULT_SIGNAL_EPSILON,
+    DEFAULT_SIGNAL_EPSILON, DeterminismReport, FixedPriceMismatch, RegimeMismatch, SignalMismatch,
+    SnapshotMismatch, assert_fixed_price_identical, assert_regime_identical, assert_signal_epsilon,
 };
 pub use driver::ReplayDriver;
 pub use fill_sim::{FillModel, MockFillSimulator};

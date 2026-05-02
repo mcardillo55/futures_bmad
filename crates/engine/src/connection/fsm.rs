@@ -98,9 +98,9 @@ mod tests {
         CircuitBreakers,
         crossbeam_channel::Receiver<CircuitBreakerEvent>,
     ) {
-        use std::sync::Arc;
         use crate::persistence::journal::EventJournal;
         use crate::risk::panic_mode::PanicMode;
+        use std::sync::Arc;
 
         let (tx, rx) = unbounded();
         let (panic_tx, _panic_rx) = EventJournal::channel();
@@ -121,16 +121,8 @@ mod tests {
     #[test]
     fn benign_transitions_do_not_trip_breaker() {
         let (mut fsm, mut cb, rx) = fixture();
-        fsm.transition(
-            ConnectionState::Reconnecting,
-            &mut cb,
-            UnixNanos::new(1),
-        );
-        fsm.transition(
-            ConnectionState::Reconciling,
-            &mut cb,
-            UnixNanos::new(2),
-        );
+        fsm.transition(ConnectionState::Reconnecting, &mut cb, UnixNanos::new(1));
+        fsm.transition(ConnectionState::Reconciling, &mut cb, UnixNanos::new(2));
         fsm.transition(ConnectionState::Connected, &mut cb, UnixNanos::new(3));
 
         assert_eq!(
@@ -143,11 +135,7 @@ mod tests {
     #[test]
     fn circuit_break_transition_trips_breaker() {
         let (mut fsm, mut cb, rx) = fixture();
-        fsm.transition(
-            ConnectionState::CircuitBreak,
-            &mut cb,
-            UnixNanos::new(42),
-        );
+        fsm.transition(ConnectionState::CircuitBreak, &mut cb, UnixNanos::new(42));
 
         assert_eq!(
             cb.state(BreakerType::ConnectionFailure),

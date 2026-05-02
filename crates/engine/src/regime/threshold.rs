@@ -492,7 +492,10 @@ mod tests {
         // r1 = |95 - 100| = 5, r2 = |95 - 99| = 4, r3 = |100 - 99| = 1.
         // max = 5. Without `.abs()` on r1 the test would observe 4
         // (r2 dominates), revealing the silent understatement.
-        assert!((atr - 5.0).abs() < f64::EPSILON, "expected TR=5.0, got {atr}");
+        assert!(
+            (atr - 5.0).abs() < f64::EPSILON,
+            "expected TR=5.0, got {atr}"
+        );
     }
 
     #[test]

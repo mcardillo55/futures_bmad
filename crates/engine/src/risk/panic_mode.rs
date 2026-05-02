@@ -23,9 +23,7 @@ use tracing::error;
 use crate::persistence::journal::{
     CircuitBreakerEventRecord, EngineEvent as JournalEvent, JournalSender, SystemEventRecord,
 };
-use crate::risk::alerting::{
-    Alert, AlertSender, FlattenAttemptDetail, PositionSnapshot,
-};
+use crate::risk::alerting::{Alert, AlertSender, FlattenAttemptDetail, PositionSnapshot};
 
 /// Two-state panic discriminator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

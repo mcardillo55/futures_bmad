@@ -1,8 +1,14 @@
 # Live trading configuration
 # WARNING: This config connects to live markets with real money.
+#
+# Story 7.3: `[broker] mode` is the single switch that selects between live
+# (real Rithmic OrderPlant) and paper (in-process MockBrokerAdapter) order
+# routing. Everything else in this file MUST mirror paper.toml so paper /
+# live behaviour cannot diverge by accident.
 
 # [trading]
 # mode = "live"
 
-# [broker]
+[broker]
+mode = "live"
 # server = "rithmic-live"

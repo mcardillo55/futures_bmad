@@ -1,5 +1,13 @@
+# Paper trading configuration — Story 7.3.
+#
+# This file selects the in-process MockBrokerAdapter for order routing while
+# still pulling LIVE market data from Rithmic. The single switch is
+# `[broker] mode = "paper"`; everything else mirrors live.toml so behaviour
+# differences cannot accumulate by accident.
+
 [trading]
 # mode = "paper"
 
 [broker]
+mode = "paper"
 # server = "rithmic-paper"

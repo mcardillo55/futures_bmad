@@ -1,44 +1,68 @@
 //! `engine` binary entry point.
 //!
-//! V1 surface (Story 7.1): the only supported mode is replay. Live trading
-//! mode (`--live`) is reserved for Epic 8 (startup sequence). Running the
-//! binary without `--replay` therefore prints help and exits with a
+//! Supported modes (Story 7.3 added paper):
+//!
+//! * `--replay <parquet-path>` — Story 7.1: deterministic historical
+//!   replay via [`ReplayOrchestrator`] (SimClock + MockBrokerAdapter +
+//!   Parquet source).
+//! * `--paper --config <toml>` — Story 7.3: live data, simulated
+//!   execution. Reads `[broker] mode = "paper"` from `<toml>` and
+//!   wires a [`PaperTradingOrchestrator`] (SystemClock +
+//!   MockBrokerAdapter + live data feed).
+//! * `--live --config <toml>` — reserved for Epic 8 (startup sequence).
+//!   Currently exits with `not yet implemented`.
+//!
+//! Running the binary without picking a mode prints help and exits with a
 //! non-zero status code so an operator never accidentally launches the
 //! engine without having chosen a mode.
 //!
-//! Replay startup wiring (Story 7.1 Task 6.2): the binary detects the
-//! `--replay <path>` flag and constructs a [`ReplayOrchestrator`] instead
-//! of any live broker connection. All downstream code (event loop,
-//! signals, risk, regime, order manager, journal) is unaware of replay vs
-//! live — see `replay/orchestrator.rs` for the wiring.
+//! Story 7.3 AC — broker-mode selection happens HERE and ONLY HERE. After
+//! the right adapter is constructed, every downstream component (event
+//! loop, signals, risk, regime, order manager, journal) is adapter-
+//! agnostic.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
+use futures_bmad_core::BrokerMode;
+use futures_bmad_engine::paper::{
+    MarketDataFeed, PaperTradingConfig, PaperTradingOrchestrator, VecMarketDataFeed,
+};
 use futures_bmad_engine::replay::{FillModel, ReplayConfig, ReplayOrchestrator};
+use futures_bmad_engine::startup::{load_config, sanity_check_paper_credentials};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "engine",
     about = "futures_bmad trading engine",
-    long_about = "Run the trading engine. Currently the only supported mode is \
-                  --replay <parquet-path>; live mode lands in Epic 8."
+    long_about = "Run the trading engine. Pick exactly one mode: --replay <parquet>, \
+                  --paper --config <toml>, or --live --config <toml> (Epic 8)."
 )]
 struct Cli {
     /// Replay historical data from a Parquet file or a directory of
-    /// date-partitioned Parquet files. Mutually exclusive with live mode
-    /// (live mode not yet implemented).
-    #[arg(long, value_name = "PARQUET_PATH")]
+    /// date-partitioned Parquet files. Mutually exclusive with --paper /
+    /// --live.
+    #[arg(long, value_name = "PARQUET_PATH", conflicts_with_all = ["paper", "live"])]
     replay: Option<PathBuf>,
 
-    /// Optional path to a TOML config file (currently informational only;
-    /// loaded by Epic 8). Accepted so the spec example
-    /// `--replay <path> --config <path>` parses cleanly.
+    /// Run in paper-trading mode — live data with simulated execution
+    /// (Story 7.3). Requires `--config <toml>` whose `[broker] mode` is
+    /// either `paper` (mode honored) or `live` (refused so an operator
+    /// cannot accidentally route real orders by passing the wrong flag).
+    #[arg(long, conflicts_with = "live")]
+    paper: bool,
+
+    /// Run in live-trading mode. Currently NOT implemented — Epic 8 lands
+    /// the full live startup sequence.
+    #[arg(long)]
+    live: bool,
+
+    /// Path to a TOML config file. Required for `--paper` and `--live`;
+    /// optional for `--replay` (currently informational only).
     #[arg(long, value_name = "CONFIG_PATH")]
-    #[allow(dead_code)]
     config: Option<PathBuf>,
 }
 
@@ -48,14 +72,31 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
-    let Some(replay_path) = cli.replay else {
+    if let Some(replay_path) = cli.replay {
+        return run_replay(replay_path);
+    }
+
+    if cli.paper {
+        return run_paper(cli.config);
+    }
+
+    if cli.live {
         error!(
-            "no mode selected — pass `--replay <parquet-path>` to run replay. \
-             Live mode is not yet implemented (Epic 8)."
+            "live mode is not yet implemented (Epic 8 — startup sequence). \
+             Use --paper --config <toml> for paper trading or --replay <parquet> for replay."
         );
         return ExitCode::from(2);
-    };
+    }
 
+    error!(
+        "no mode selected — pass `--replay <parquet>` for replay, \
+         `--paper --config <toml>` for paper trading (Story 7.3), or \
+         `--live --config <toml>` for live (Epic 8, not yet implemented)."
+    );
+    ExitCode::from(2)
+}
+
+fn run_replay(replay_path: PathBuf) -> ExitCode {
     info!(path = %replay_path.display(), "starting replay");
 
     let cfg = ReplayConfig {
@@ -109,6 +150,78 @@ fn main() -> ExitCode {
         "speed multiple:   {:.1}x real-time",
         summary.replay_speed_multiple
     );
+
+    ExitCode::SUCCESS
+}
+
+/// Story 7.3 paper-mode entry point.
+///
+/// Loads the broker mode from the supplied config, constructs the right
+/// orchestrator, and pumps until the data feed is exhausted. The V1 binary
+/// uses an empty in-process feed because the live Rithmic data path lands
+/// in Epic 8 — operators run paper mode through a test harness today;
+/// production deployments will gain the live data wiring once Epic 8
+/// merges. The orchestrator and config plumbing are stable across that
+/// future change.
+fn run_paper(config_path: Option<PathBuf>) -> ExitCode {
+    let Some(path) = config_path else {
+        error!("--paper requires --config <toml>. Example: --paper --config config/paper.toml");
+        return ExitCode::from(2);
+    };
+
+    let cfg = match load_config(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "failed to load paper config");
+            return ExitCode::from(1);
+        }
+    };
+
+    if cfg.broker.mode != BrokerMode::Paper {
+        error!(
+            mode = cfg.broker.mode.as_str(),
+            "config selects mode {} but --paper was passed; refusing to start. \
+             Set [broker] mode = \"paper\" in {}.",
+            cfg.broker.mode.as_str(),
+            path.display()
+        );
+        return ExitCode::from(2);
+    }
+
+    sanity_check_paper_credentials(cfg.broker.mode);
+
+    info!(config = %path.display(), "starting paper trading");
+
+    // Empty feed for V1: the live Rithmic data wiring lands in Epic 8.
+    // The orchestrator + adapter selection is what Story 7.3 ships; once
+    // 8.x bridges Rithmic into a `MarketDataFeed` impl, this `let feed = `
+    // line is the only change required to flip from "no-op binary" to
+    // "live data, simulated execution".
+    let feed: VecMarketDataFeed = VecMarketDataFeed::new(Vec::new());
+    let _: &dyn MarketDataFeed = &feed; // proof: the feed is a trait object slot.
+    let mut orch = PaperTradingOrchestrator::new(PaperTradingConfig::default(), feed);
+    orch.emit_startup_banner();
+    let summary = orch.pump_until_idle();
+
+    info!(
+        events_consumed = summary.events_consumed,
+        orders_processed = summary.orders_processed,
+        fills_emitted = summary.fills_emitted,
+        fills_consumed = summary.fills_consumed,
+        "PAPER TRADING SUMMARY"
+    );
+    println!("--- paper trading summary ---");
+    println!("events consumed: {}", summary.events_consumed);
+    println!("orders processed: {}", summary.orders_processed);
+    println!("fills emitted:    {}", summary.fills_emitted);
+    println!("fills consumed:   {}", summary.fills_consumed);
+    if summary.events_consumed == 0 {
+        warn!(
+            "paper mode binary completed with zero events — V1 ships without a live data \
+             feed wired in (Epic 8 lands the Rithmic bridge). The orchestrator + adapter \
+             selection ARE in place; integration tests exercise the full paper data path."
+        );
+    }
 
     ExitCode::SUCCESS
 }

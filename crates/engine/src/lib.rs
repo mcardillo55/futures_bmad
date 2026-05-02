@@ -8,12 +8,14 @@ pub mod event_loop;
 pub mod ingest;
 pub mod order_book;
 pub mod order_manager;
+pub mod paper;
 pub mod persistence;
 pub mod regime;
 pub mod replay;
 pub mod risk;
 pub mod signals;
 pub mod spsc;
+pub mod startup;
 
 pub use buffer_monitor::{BufferMonitor, BufferState};
 pub use event_loop::{EventLoop, EventLoopHandle};

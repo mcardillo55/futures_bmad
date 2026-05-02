@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-16
-last_updated: 2026-05-01  # epic 6 retrospective complete
+last_updated: 2026-05-01  # story 7-1 done
 project: futures_bmad
 project_key: NOKEY
 tracking_system: file-system
@@ -98,7 +98,7 @@ development_status:
 
   # Epic 7: Historical Replay & Paper Trading
   epic-7: in-progress
-  7-1-replay-orchestrator: ready-for-dev
+  7-1-replay-orchestrator: done
   7-2-deterministic-replay-verification: ready-for-dev
   7-3-paper-trading-mode: ready-for-dev
   7-4-paper-trade-result-recording: ready-for-dev

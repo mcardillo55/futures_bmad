@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 futures_bmad_core = { workspace = true }
 futures_bmad_broker = { workspace = true }
+futures_bmad_testkit = { workspace = true }
 tokio = { workspace = true }
 rtrb = { workspace = true }
 tracing = { workspace = true }
@@ -20,10 +21,14 @@ thiserror = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+clap = { workspace = true }
+async-trait = { workspace = true }
+
+[[bin]]
+name = "engine"
+path = "src/main.rs"
 
 [dev-dependencies]
-futures_bmad_testkit = { workspace = true }
 tempfile = "3"
-async-trait = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 toml = { workspace = true }

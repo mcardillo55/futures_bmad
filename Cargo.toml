@@ -79,3 +79,7 @@ async-trait = { version = "0.1" }
 # TOML parsing (dev-dependencies only — runtime config loads via the
 # `config` crate; tests parse TOML strings directly to verify deserialisers).
 toml = { version = "0.8" }
+
+# CLI argument parsing — used by the engine binary's `--replay <parquet-path>`
+# flag (Story 7.1). Listed under Dev Notes → Dependencies in the story spec.
+clap = { version = "4.5", features = ["derive"] }

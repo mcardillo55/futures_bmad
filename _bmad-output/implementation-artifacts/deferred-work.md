@@ -157,6 +157,47 @@ Note: S-2 from this review (partial entry over-sizes SL/TP via warn-only) is the
 
 - **`atr_period = 0` returns ATR=0.0 silently** — There is no validator on `ThresholdRegimeConfig::atr_period`. With `atr_period = 0`, `compute_atr` returns `0.0` regardless of buffer contents, classification collapses to non-volatile branches with no warning. Resolution: validate `atr_period >= 1` at config load. Owned by Story 8.1 or whichever story tightens `ThresholdRegimeConfig` validation. [`crates/engine/src/regime/threshold.rs::compute_atr`, `crates/core/src/config/regime.rs`]
 
+## Deferred from: code review of story-7.1 (2026-05-01)
+
+- S-1: Orchestrator's `run()` bypasses the production `EventLoop` entirely — skips `BufferMonitor`, `StaleDataDetector`, `SequenceGapDetector`, `DataQualityGate`, `EventWindowManager`, `CircuitBreakers`, `PositionTracker`, and journal-side `TradeEvent` emission. Either route replay through the real event loop or document the V1 scope honestly in module docstrings. [`crates/engine/src/replay/orchestrator.rs:362-467`, `crates/engine/src/replay/mod.rs:11-12,19-22`]
+- S-2: Production binary in `main.rs` never calls `attach_journal()`; only `replay_start`/`replay_complete` system events flow even when a journal is attached. Wire journal in `main.rs` and document that trade-event journaling is Story 7.3/7.4 scope. [`crates/engine/src/main.rs:45-105`, `crates/engine/src/replay/orchestrator.rs:283-285,490-500`]
+- S-3: `ReplayDriver` is `pub`-exported but dead code relative to the orchestrator's own loop — divergent from the orchestrator's loop and a footgun for future contributors. Delete it. [`crates/engine/src/replay/driver.rs`, `crates/engine/src/replay/mod.rs:24,29`]
+- N-3: `tracing_subscriber_init` in `main.rs` is a no-op; production replay produces no log output. Replace silent error path at main.rs:52-56 with `eprintln!` so missing mode is visible. [`crates/engine/src/main.rs:107-117`]
+- N-5: `validate_schema` does not verify nullability — a Parquet file with nullable columns passes validation and panics at iteration. Document nullability policy and add a test. [`crates/engine/src/replay/data_source.rs:214-235`]
+
+## Deferred from: code review of story-7.2 (2026-05-01)
+
+- S-1: `ReplayResult::compare()` silently truncates to `min(a.len(), b.len())` for all five vector pairs — length divergence is invisible to `is_deterministic`. Mirror the existing `total_trades` sentinel pattern to surface length mismatches as a determinism failure. [`crates/engine/src/replay/orchestrator.rs::compare`]
+- S-2: `assert_initial_pipeline_state` doc claims it asserts post-reset signal internals; in practice it only checks the snapshot serde surface. Tighten the docstring or expand the assertion. [`crates/engine/src/replay/orchestrator.rs::assert_initial_pipeline_state`]
+- S-3: OBI and microprice always report `None` because `apply_market_event` only populates index 0 of the order book; determinism gate is effectively single-axis (VPIN only) until Epic-2 L2 book replay lands. Add a top-of-file note to `tests/replay_determinism.rs` and track explicit L2 follow-up. [`crates/engine/src/order_book.rs:6-45`, `crates/engine/src/signals/obi.rs:40-43`, `crates/engine/src/signals/microprice.rs:35-39`]
+- N-1: Test parquet fixture is regenerated-if-missing — a stale or generator-divergent regeneration would silently re-baseline. Commit a hash of the parquet or require the file to be present. [`crates/engine/tests/replay_determinism.rs:149-168`]
+- N-2: `compare_signal_series` records `(Some, None)` divergence with `actual = NaN`, but NaN is also a real signal value — conflates two failure modes. Add a discriminator field to `SignalMismatch` or use `f64::INFINITY` as sentinel. [`crates/engine/src/replay/orchestrator.rs:312-328`]
+- N-4: `BarBuilder::flush` is called unconditionally at end-of-replay; no test verifies the final partial bar is included in `regime_states`. Add unit test. [`crates/engine/src/replay/orchestrator.rs:1000-1007,1207-1217`]
+- N-5: `PipelineSnapshotSerde::PartialEq` derives `f64::PartialEq` which is NaN-asymmetric — defence-in-depth assert would NOT catch NaN snapshot values. Add a comment or implement `PartialEq` manually for NaN-NaN equality. [`crates/engine/src/replay/orchestrator.rs:171-176`]
+
+## Deferred from: code review of story-7.3 (2026-05-01)
+
+- S-1: Orchestrator routes orders straight from the SPSC into `MockFillSimulator::simulate`, never invoking `BrokerAdapter::submit_order`; the BrokerAdapter is held but ornamental on the order path. AC1/Task 3.4 require routing via `submit_order`. Owned by Story 8.2 wiring. [`crates/engine/src/paper/orchestrator.rs`]
+- S-2: PaperTradingOrchestrator owns NO circuit breakers, risk, regime, or position tracker. The `circuit_breakers_trip_identically_in_paper_mode` test proves the breaker code works in isolation, NOT that the orchestrator integrates it. AC2 ("all subsystems function normally") is structurally unwired. Owned by Story 8.2. [`crates/engine/src/paper/orchestrator.rs`]
+- S-3: `MarketDataFeed::next_event` returning `None` conflates "end of stream" with "no event right now" — `pump_until_idle` exits on first quiet moment of any production stream. Split into `enum { Event, Idle, Terminated }` or add `is_terminated()`. Breaks the dev's "one-line Epic-8 swap" claim. [`crates/engine/src/paper/data_feed.rs:23-37`, `crates/engine/src/paper/orchestrator.rs:340-373`]
+- S-4: `engine --paper --config config/paper.toml` ships as zero-event smoke runner: no journal, no subscriptions, no live data wiring. Document the V1 scope in startup banner or refuse to start without explicit `--smoke` flag. [`crates/engine/src/main.rs:154-211`]
+- N-2: `subscribe_all` is async but binary's `run_paper` is sync — subscriptions never reach the in-process broker. Promote `tokio` to non-dev dep and run from a runtime when wiring subscription handling. [`crates/engine/src/paper/orchestrator.rs:209-220`, `crates/engine/src/main.rs:154-211`]
+- N-5: `sanity_check_paper_credentials` reads env var directly; env-var-touching tests race in parallel, making the warning branch effectively untestable. Take env-var name/reader as parameter or document the untested gap. [`crates/engine/src/startup.rs:84-103`]
+- N-6: Duplicate `shipped_*_config_*` tests in `startup.rs::tests` and `tests/paper_trading.rs`; both rely on workspace-relative paths. Drop one or rename to clarify. [`crates/engine/src/startup.rs:175-198`, `crates/engine/tests/paper_trading.rs:218-227`]
+
+## Deferred from: code review of story-7.4 (2026-05-02)
+
+- **B-1 (LIVE-TRADING EXIT GATE; close before Epic 8 enables paper):** `JournalSender` source-override seam works in isolation but `OrderManager` and `BracketManager` are constructed only in `#[cfg(test)]` blocks — production `engine --paper` writes zero paper-tagged trade rows. The 9 integration tests pass because they manually call `paper_sender.send(...)` themselves. The mechanism is correct; the wiring from a paper orchestrator to `OrderManager`/`BracketManager` does not exist. AC1 ("paper trades recorded with same fidelity as live") and AC3 ("journal contains sufficient data for go/no-go decision") cannot be verified end-to-end until 8.2 wires this. Add a wiring regression test that codifies the gap until 8.2 lands. [`crates/engine/src/paper/orchestrator.rs:212-222`, `crates/engine/src/order_manager/mod.rs:243`, `crates/engine/src/order_manager/bracket.rs:599`]
+- S-3: `decision_id = 0` sentinel-as-`None` collision means `trace_decision(0)` returns every NFR17-violating row across all sources. Refuse `decision_id = 0` in `trace_decision` (one-line guard) or migrate `trade_events.decision_id` to nullable. [`crates/engine/src/persistence/journal.rs:643-644`, `crates/engine/src/persistence/query.rs:330-334`]
+- S-4: `pnl_summary` and `paper_readiness_report` silently drop any fill row whose `kind` doesn't match the hard-coded list of five strings. Compute P&L from rows with `size > 0` and non-empty `decision_id`, or emit `kind` as an enum. [`crates/engine/src/persistence/query.rs:549-554`]
+- S-5: Replay now writes `source = "replay"` records into the same database as paper/live; no operator-UX guard against a replay run polluting paper-readiness data. Default replay to a separate file (`data/replay.db`) or require explicit `--journal=` flag. [`crates/engine/src/replay/orchestrator.rs:626-628`, `crates/engine/src/persistence/journal.rs:40`]
+- N-1: `TradeSource::parse` returns `None` on unknown variants; `row_to_trade_record` silently coerces unknown → `Live` (default), losing the corruption signal. Log `warn!` when parse returns `None`. [`crates/engine/src/persistence/query.rs:341,358`]
+- N-3: `paper_and_live_trades_differ_only_in_source_tag` integration test uses `journal.write_event` (single-event writes), bypassing the channel + batching path it claims to test. Rename or restructure to actually run the worker. [`crates/engine/tests/paper_trade_recording.rs:380-388`]
+- N-4: `MockBrokerAdapter::source()` accessor is public but no test asserts it carries the right value after `with_source` construction. Add one-line test. [`crates/testkit/src/mock_broker.rs:55`]
+- N-5: `JournalQuery::trades_by_source` materializes all columns even when callers only need count; no `count_by_source` companion at the SQL level. Refactor `pair_trades_pnl` to stream rows. [`crates/engine/src/persistence/query.rs:203-216`]
+- N-6: `compute_readiness_report` divides by `n` inferred from `total_trades` already computed — redundant float conversion. Trivial cleanup. [`crates/engine/src/persistence/query.rs:430-431`]
+- N-7: `ReadinessReport::fmt_one_line` formats `win_rate` as 3 decimals (`0.500`); operators may misread as 50% vs 0.5 of a percent. Format as `50.0%` or document convention prominently. [`crates/engine/src/persistence/query.rs:170-184`]
+
 ---
 
 ## Live-Trading Exit Gates
@@ -173,15 +214,17 @@ Note: S-2 from this review (partial entry over-sizes SL/TP via warn-only) is the
 | ~~5-3 B-1~~ | story-5.3 review | HIGH | **RESOLVED (pre-Epic-6 cleanup)** | `CircuitBreakers::permits_trading()` now consults panic mode; `DenialReason::PanicModeActive` variant added and prepended to `reasons` when active. | — |
 | 5-3 B-2 | story-5.3 review | HIGH | **PRODUCER RESOLVED (pre-Epic-6 cleanup); CONSUMER OPEN** | Producer wired: `EventLoop::attach_anomaly_detection(...)` + per-tick `check_position_anomaly` + `try_send` `FlattenRequest` on `tokio::sync::mpsc::Sender<FlattenRequest>` (full-channel ⇒ warn + journal `flatten_request_dropped`). The matching `Receiver<FlattenRequest>` drain and the async `handle_anomaly` consumer task remain owned by Story 8.2. | Story 8.2 (consumer side) |
 | ~~5-4 P1~~ | story-5.4 review | HIGH | **RESOLVED (pre-Epic-6 cleanup)** | `FeeGateReason::StaleSchedule` deleted; `>60 days` branch removed from `FeeGate::permits_trade`; `>30 days` warn relocated to `CircuitBreakers::check_fee_staleness`. `CircuitBreakers::check_fee_staleness` / `BreakerType::FeeStaleness` is the sole staleness owner. | — |
+| 7-4 B-1 | story-7.4 review | HIGH | OPEN | `JournalSender` source-override seam is correct in isolation but `OrderManager`/`BracketManager` are constructed only in test code; production `engine --paper` writes zero paper-tagged trade rows. Mechanism works; wiring missing. AC1/AC3 cannot be verified end-to-end until wired. | Story 8.2 (paper-mode wiring of `OrderManager`/`BracketManager` through `paper_orchestrator.journal_sender()`) |
 
 **Note on 5-3 B-2:** This row is split — the producer side resolved here in pre-Epic-6 cleanup, but the consumer side (the `Receiver<FlattenRequest>` drain and the `handle_anomaly` async task) remains Story 8.2's responsibility. The ID is intentionally NOT struck through to reflect that the gate is not yet fully closed.
 
-**Status summary (post pre-Epic-6 cleanup commit):**
+**Status summary (post Epic 7 close):**
 - 3 RESOLVED at the framework level (5-3 B-1, 5-3 B-2 producer, 5-4 P1).
-- 3 still OPEN, all targeting Story 8.2:
+- 4 still OPEN, all targeting Story 8.2:
   - 4-5 S-1 (reconciliation race)
   - 4-5 S-2 — `OrderManager::submit_order` STILL does not call `CircuitBreakers::permits_trading()` / `permits_trade_evaluation()`. The framework now returns the right answer (D-1 closed) but the call-site wiring from `submit_order` is Story 8.2's.
   - 4-5 S-3 / 4-3 S-2 / 4-4 S-2 (partial-entry SL/TP oversizing)
-- 5-3 B-2 partially open: the `EventLoop` producer is wired in this commit, but the matching `Receiver<FlattenRequest>` drain and the async `handle_anomaly` consumer task on the broker runtime are Story 8.2's.
+  - 7-4 B-1 (paper-mode `OrderManager`/`BracketManager` JournalSender wiring; production paper runs write zero paper-tagged rows today)
+- 5-3 B-2 partially open: the `EventLoop` producer is wired, but the matching `Receiver<FlattenRequest>` drain and the async `handle_anomaly` consumer task on the broker runtime are Story 8.2's.
 
 **Resolution discipline:** when closing, update the original `## Deferred from:` section with `[x]` and a one-line resolution note (commit hash if applicable). Then mark resolved here. DO NOT silently delete entries.
